@@ -1,0 +1,394 @@
+// Naming + folder-placement proposal stage. Reads the most recent
+// classification result for a file and, if there's a real basis to act on
+// it, writes a RenameProposal for human review -- never applies it. The
+// proposal can carry a new filename, a new folder (proposed_relative_dir,
+// migration 013), or both -- bulkRenameProcessor applies whichever fields
+// are set once approved.
+const path = require("path");
+const db = require("../../config/database");
+const fileRepository = require("../../repositories/fileRepository");
+const fileMetadataRepository = require("../../repositories/fileMetadataRepository");
+const fileContentRepository = require("../../repositories/fileContentRepository");
+const { looksLikeMojibake } = require("../../services/extraction/ole/codePageString");
+const classificationResultRepository = require("../../repositories/classificationResultRepository");
+const subjectRepository = require("../../repositories/subjectRepository");
+const documentTypeRepository = require("../../repositories/documentTypeRepository");
+const renameProposalRepository = require("../../repositories/renameProposalRepository");
+const storageLocationRepository = require("../../repositories/storageLocationRepository");
+const auditLogRepository = require("../../repositories/auditLogRepository");
+const { buildCanonicalName, buildTargetRelativeDir } = require("../../services/namingService");
+const { ConfidenceLevel, JobType } = require("../../models/enums");
+const { enqueueJob } = require("../../queues");
+const env = require("../../config/env");
+
+// Filters out embedded document-title metadata that's technically present
+// but useless as a filename -- Office/PDF tools love to default this field
+// to something like "Document1" or leave it blank-but-not-null.
+const JUNK_TITLE_PATTERN = /^(untitled|document\d*|new microsoft word document|presentation\d*|book\d*|slide\d*|model|normal|template|copy of .*)$/i;
+
+/**
+ * A title shared by at least this many files is the TEMPLATE's title, not the
+ * document's.
+ *
+ * Measured on the live corpus before choosing the number: 403 files carry the
+ * organisation's name as their title, 25 more carry its French translation,
+ * 20 say "Secretariat General", and in total 758 of 1,368 titled files share
+ * a title with at least four others. Meanwhile the genuinely descriptive
+ * titles are almost all unique.
+ *
+ * Five is deliberately low. The cost of being wrong in each direction is not
+ * symmetric: wrongly rejecting a real title leaves a file with the name a
+ * person already gave it, while wrongly accepting boilerplate renames
+ * hundreds of unrelated documents to the same string -- which is exactly what
+ * was reported.
+ */
+const BOILERPLATE_TITLE_MIN_FILES = 5;
+
+function isUsableTitle(title) {
+  if (!title) return false;
+  const trimmed = String(title).trim();
+  if (trimmed.length < 2 || trimmed.length > 150) return false;
+  if (JUNK_TITLE_PATTERN.test(trimmed)) return false;
+
+  // A title decoded with the wrong code page is worse than no title: it is
+  // confident, non-empty garbage that sails past every other check and ends
+  // up proposed as a real document's new filename. The OLE reader now decodes
+  // properly (see ole/codePageString.js), but this is the backstop -- any
+  // future extractor that gets an encoding wrong fails safe, and the file
+  // keeps the name a person gave it.
+  if (looksLikeMojibake(trimmed)) return false;
+
+  return true;
+}
+
+/**
+ * Is this title shared with enough other files to be template boilerplate?
+ *
+ * Recorded in the audit log when it fires, because "why was this file not
+ * renamed" is otherwise unanswerable -- and the answer is a genuinely useful
+ * fact about the corpus: the template carries the organisation's name.
+ */
+async function isBoilerplateTitle(title, fileId) {
+  const shared = await fileMetadataRepository.countFilesSharingTitle(title, {
+    cap: BOILERPLATE_TITLE_MIN_FILES,
+  });
+  if (shared < BOILERPLATE_TITLE_MIN_FILES) return false;
+
+  await auditLogRepository.record({
+    action: "rename.boilerplate_title_ignored",
+    entityType: "file",
+    entityId: fileId,
+    newState: { title, sharedWithAtLeast: shared },
+    reason:
+      `The embedded title "${title}" is shared with at least ${shared} other files, so it describes the ` +
+      "template rather than this document. Ignored for naming; the file keeps its existing name unless " +
+      "something else can describe it better.",
+  });
+  return true;
+}
+
+async function handle({ fileId }) {
+  const file = await fileRepository.findById(fileId);
+  if (!file || file.status === "deleted" || file.status === "missing") {
+    return { skipped: true, reason: "file not active" };
+  }
+
+  const [classifications, fileMetadata, content] = await Promise.all([
+    classificationResultRepository.listProposedForFile(fileId),
+    fileMetadataRepository.findByFile(fileId),
+    fileContentRepository.findByFile(fileId),
+  ]);
+  const latest = classifications[0];
+
+  // THE LAST LINE OF DEFENCE FOR A FILE'S EXISTING NAME.
+  //
+  // Reported from real use: scanned PDFs were being proposed for renaming
+  // into gibberish, because the extractor returned noise, the AI tier read
+  // the noise, and a confident title came back. The upstream stages now
+  // refuse to use unusable text -- but a file can still arrive here with a
+  // classification made purely from its own filename.
+  //
+  // Proposing a rename in that situation cannot improve anything: the only
+  // information available IS the current name, so the "proposal" is at best
+  // a reshuffle of it and at worst an invention. A name a person chose is
+  // more trustworthy than one derived from an unreadable file, so when there
+  // is no readable content and no embedded title, the file keeps its name.
+  //
+  // An embedded title still counts: that is metadata the author wrote, and
+  // it survives even when the page content does not extract.
+  const textUnusable = Boolean(content?.text_quality) && content.text_quality !== "ok";
+  const embeddedTitleRaw = fileMetadata?.metadata?.title;
+  if (textUnusable && !isUsableTitle(embeddedTitleRaw)) {
+    await auditLogRepository.record({
+      action: "rename.skipped_unreadable",
+      entityType: "file",
+      entityId: fileId,
+      newState: { textQuality: content.text_quality, needsOcr: content.needs_ocr === true },
+      reason:
+        `Keeping the existing filename: this file's text came back as "${content.text_quality}", so any ` +
+        "proposed name would be invented rather than read from the document." +
+        (content.needs_ocr ? " OCR would likely make it nameable." : ""),
+    });
+    return {
+      skipped: true,
+      reason: `text unusable (${content.text_quality}); keeping the original filename`,
+      needsOcr: content.needs_ocr === true,
+    };
+  }
+
+  // Best available real title, most to least authoritative:
+  //   1. The document's own embedded title (docProps/core.xml dc:title,
+  //      PDF Info Title) -- literally what the author named it.
+  //   2. Gemini's short_title -- its own understanding of the content,
+  //      from the AI escalation tier (file.ai_short_title, migration 012).
+  // Gemini's confidence field reflects how sure it is about the
+  // subject/document_type PICK, not about short_title -- it can
+  // legitimately say "low" on the pick (nothing in our taxonomy fits)
+  // while still having read the document correctly enough to title it.
+  const embeddedTitle = fileMetadata?.metadata?.title;
+
+  // An embedded title only counts if it is about THIS document. A title that
+  // hundreds of other files also carry came from the Word template, and using
+  // it renames all of them to the organisation's name.
+  const embeddedIsUsable =
+    isUsableTitle(embeddedTitle) && !(await isBoilerplateTitle(embeddedTitle, fileId));
+
+  const titleSource = embeddedIsUsable
+    ? "embedded"
+    : isUsableTitle(file.ai_short_title)
+      ? "ai"
+      : null;
+  const bestTitle = titleSource === "embedded" ? embeddedTitle : titleSource === "ai" ? file.ai_short_title : null;
+
+  if (!latest || (latest.confidence_level === ConfidenceLevel.LOW && !bestTitle)) {
+    return { skipped: true, reason: "no sufficiently confident classification to name from" };
+  }
+
+  const [subject, documentType] = await Promise.all([
+    latest.classified_subject_id ? subjectRepository.findById(latest.classified_subject_id) : null,
+    latest.classified_document_type_id ? documentTypeRepository.findById(latest.classified_document_type_id) : null,
+  ]);
+
+  // Nothing to name from AND nowhere to file it -- there is no proposal to
+  // make. (A subject with no title is still worth a proposal: the move.)
+  if (!subject && !bestTitle) {
+    return { skipped: true, reason: "no usable title and no subject to file under; keeping the original name" };
+  }
+
+  // NO TITLE MEANS NO RENAME.
+  //
+  // Without a real title the only thing left to build a name from is the
+  // taxonomy bucket, which produces "Academic.pdf" and "Finance.docx" --
+  // technically a name, and worse than what the file already had. It also
+  // collides: every unnamed file in a subject wants the same one.
+  //
+  // The existing filename was chosen by a person and is usually fine, so it
+  // stands. Filing the document under its subject is still worthwhile and
+  // still happens below -- naming and placement are separate decisions, and
+  // failing at one is no reason to skip the other.
+  const canRename = Boolean(bestTitle);
+
+  // file.ai_entities comes from the AI escalation tier when it extracted
+  // party/date/identifier from the actual content -- used to lightly
+  // disambiguate the title (e.g. an identifier not already in the title
+  // text), not to replace it. See namingService.js for the full priority
+  // order.
+  const proposedFilename = canRename
+    ? buildCanonicalName({
+        subject,
+        documentType,
+        filenameOriginal: file.filename_original,
+        extension: file.extension,
+        entities: file.ai_entities || null,
+        shortTitle: bestTitle,
+      })
+    : file.filename_current;
+
+  // Folder placement: the classified Subject determines where the file
+  // should live (e.g. "Finance/Budgets"), independent of what it's named --
+  // this is the other half of "store it under Finance, but don't repeat
+  // that in the filename too." Only proposed when it's an actual change
+  // from where the file already is, and only when there's a confident
+  // Subject to place it under (never invents a folder any more than the
+  // naming side invents a category).
+  const currentRelativeDir = path.dirname(file.current_path) === "." ? "" : path.dirname(file.current_path);
+  let proposedRelativeDir = null;
+  if (subject) {
+    const ancestorChain = await subjectRepository.getAncestorChain(subject.id);
+    const targetDir = buildTargetRelativeDir(ancestorChain) || "";
+    if (targetDir && targetDir !== currentRelativeDir) proposedRelativeDir = targetDir;
+  }
+
+  const nameUnchanged = proposedFilename === file.filename_current;
+  const noMoveNeeded = !proposedRelativeDir;
+  if (nameUnchanged && noMoveNeeded) {
+    return { skipped: true, reason: "proposed name and folder both match the current state" };
+  }
+
+  // Bug fix: don't blindly recreate a proposal the user already rejected.
+  // Without this, rescanning/re-touching a file (e.g. removing it and
+  // re-uploading the exact same content) regenerated the identical
+  // rename proposal in Pending, making the earlier rejection meaningless.
+  // A proposal with a genuinely different proposed_filename/folder (real
+  // content or classification change) is unaffected -- this only
+  // suppresses an exact repeat of both fields together.
+  const rejectedMatch = await renameProposalRepository.findRejectedMatch(fileId, proposedFilename, proposedRelativeDir);
+  if (rejectedMatch) {
+    await auditLogRepository.record({
+      action: "rename.reproposal_skipped",
+      entityType: "file",
+      entityId: fileId,
+      reason: `Identical rename/move to "${proposedFilename}"${proposedRelativeDir ? ` in "${proposedRelativeDir}"` : ""} was already rejected (proposal ${rejectedMatch.id}); not re-proposing without a real change.`,
+    });
+    return { skipped: true, reason: "identical rename/move already rejected", rejectedProposalId: rejectedMatch.id };
+  }
+
+  // Bug fix (real-world report): 40 files produced 78 pending proposals.
+  // Nothing here checked whether this file already had a pending proposal
+  // before inserting a new one -- if generate_names ran twice for the same
+  // file for any reason (a BullMQ retry after a transient failure partway
+  // through the job, a duplicate enqueue), it just stacked a second
+  // proposal on top. There should only ever be one pending proposal per
+  // file: an exact repeat of the same suggestion is skipped outright; a
+  // genuinely different suggestion (newer/better classification) replaces
+  // the stale one instead of sitting alongside it.
+  const existingPending = await renameProposalRepository.findPendingForFile(fileId);
+  const identicalPending = existingPending.find(
+    (p) => p.proposed_filename === proposedFilename && (p.proposed_relative_dir || null) === (proposedRelativeDir || null)
+  );
+  if (identicalPending) {
+    return { skipped: true, reason: "identical proposal already pending", pendingProposalId: identicalPending.id };
+  }
+  const namingReason = bestTitle
+    ? `named from ${titleSource === "embedded" ? "the document's own embedded title" : "the AI tier's read of the content"} ("${bestTitle}")`
+    : "keeping the existing filename (no title describes this document well enough to improve on it)";
+  const moveReason = proposedRelativeDir ? `; move into "${proposedRelativeDir}" per its classified subject` : "";
+  const reason = `${nameUnchanged ? "Name unchanged; " : ""}${namingReason}${moveReason} ` +
+    `(classification result ${latest.id}, method ${latest.method}, confidence ${latest.confidence_level})`;
+
+  // SUPERSEDE THE OLD PROPOSAL AND CREATE THE NEW ONE ATOMICALLY.
+  //
+  // These used to be separate autocommitted statements: every stale pending
+  // proposal was rejected in its own transaction, and only then was the
+  // replacement inserted. A worker killed between the two -- or an insert
+  // that failed on any of the constraints below it -- left the file with its
+  // previous suggestion REJECTED and no new one in its place. The file simply
+  // lost its pending proposal, silently, and nothing would generate another
+  // until its classification changed again.
+  //
+  // Rejecting the old one is only correct as part of replacing it, so the two
+  // belong in the same transaction. The audit rows join it for the same
+  // reason: a trace of a supersede that did not happen is worse than none.
+  const proposal = await db.withTransaction(async (client) => {
+    for (const stale of existingPending) {
+      await renameProposalRepository.review(stale.id, { status: "rejected", reviewedBy: null, client });
+      await auditLogRepository.record({
+        action: "rename.superseded",
+        entityType: "rename_proposal",
+        entityId: stale.id,
+        previousState: { status: "pending", proposedFilename: stale.proposed_filename },
+        newState: { status: "rejected", supersededByProposedFilename: proposedFilename },
+        reason: "Automatically superseded by a freshly generated proposal for the same file",
+        client,
+      });
+    }
+
+    const created = await renameProposalRepository.create({
+      fileId,
+      currentFilename: file.filename_current,
+      proposedFilename,
+      proposedRelativeDir,
+      reason,
+      metadataUsed: {
+        classificationResultId: latest.id,
+        subjectId: subject?.id || null,
+        documentTypeId: documentType?.id || null,
+        titleSource,
+        currentRelativeDir,
+      },
+      confidenceLevel: latest.confidence_level,
+      confidenceScore: latest.confidence_score,
+      client,
+    });
+
+    await auditLogRepository.record({
+      action: "rename.proposed",
+      entityType: "file",
+      entityId: fileId,
+      newState: { proposedFilename },
+      reason: "Generated from classification result",
+      client,
+    });
+
+    return created;
+  });
+
+  const autoApplied = await maybeAutoApply(proposal, file, latest);
+
+  return { renameProposalId: proposal.id, proposedFilename, proposedRelativeDir, autoApplied };
+}
+
+// Confidence tiers, strongest first (docs/01-domain-model.md §1.5).
+const CONFIDENCE_RANK = { high: 3, medium: 2, low: 1 };
+
+/**
+ * Approve and apply a proposal without human review, when the location is
+ * configured for it and the classifier was confident enough.
+ *
+ * The reason this is defensible at all is that auto-apply is gated on the
+ * location, and the locations it is meant for are READ-ONLY -- applying a
+ * name there writes `files.canonical_filename` and rebuilds a shortcut. The
+ * original file is not touched. So the worst case is a badly-named shortcut
+ * in a regenerable folder, not a mangled document.
+ *
+ * On a writable location the same setting would rename real files
+ * unattended, which is a genuinely different risk. That is refused here
+ * rather than left to whoever ticks the checkbox: turning auto-apply on for
+ * a writable location does nothing.
+ */
+async function maybeAutoApply(proposal, file, classification) {
+  const location = await storageLocationRepository.findById(file.storage_location_id);
+  if (!location?.auto_apply_naming) return false;
+
+  if (!location.is_read_only) {
+    await auditLogRepository.record({
+      action: "rename.auto_apply_refused",
+      entityType: "file",
+      entityId: file.id,
+      newState: { proposalId: proposal.id, locationId: location.id },
+      reason:
+        `Auto-apply is enabled on "${location.name}" but that location is WRITABLE, so applying ` +
+        "would rename the real file with nobody reviewing it. Left pending for review. Make the " +
+        "location read-only to use auto-apply safely.",
+    });
+    return false;
+  }
+
+  const required = CONFIDENCE_RANK[env.autoApply.minConfidence] || CONFIDENCE_RANK.high;
+  const actual = CONFIDENCE_RANK[classification.confidence_level] || 0;
+  if (actual < required) return false;
+
+  // reviewedBy stays null: nobody reviewed it. Recording a user here would
+  // put a person's name against a decision they never made.
+  await renameProposalRepository.review(proposal.id, { status: "approved", reviewedBy: null });
+  await enqueueJob(
+    JobType.BULK_RENAME,
+    { proposalIds: [proposal.id] },
+    { storageLocationId: location.id, progressTotal: 1 }
+  );
+
+  await auditLogRepository.record({
+    action: "rename.auto_applied",
+    entityType: "file",
+    entityId: file.id,
+    newState: { proposalId: proposal.id, confidence: classification.confidence_level },
+    reason:
+      `Auto-applied without review: "${location.name}" has auto-apply enabled and is read-only, and the ` +
+      `classification was ${classification.confidence_level} confidence. The original file is not renamed -- ` +
+      "only the canonical name and the shortcut mirror change, both of which are reversible.",
+  });
+
+  return true;
+}
+
+module.exports = { handle };

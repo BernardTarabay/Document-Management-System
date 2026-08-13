@@ -1,0 +1,180 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --color-base-950: #08090d;
+  --color-base-900: #0d0f16;
+  --color-base-850: #12141d;
+  --color-base-800: #171a25;
+  --color-base-700: #232633;
+  --color-base-600: #33374a;
+  --color-base-500: #4b5065;
+  --color-base-400: #6b7085;
+  --color-base-300: #9297ab;
+  --color-base-200: #c2c5d3;
+  --color-base-100: #e4e6ee;
+  --color-base-50: #f6f7fb;
+
+  --color-brand-400: #8b7bff;
+  --color-brand-500: #7c5cff;
+  --color-brand-600: #6a3ff0;
+  --color-brand-700: #5a2fd6;
+
+  --color-accent-cyan: #3ee6d8;
+  --color-accent-amber: #f5b94f;
+  --color-accent-rose: #f2617a;
+  --color-accent-emerald: #3ecf8e;
+
+  --shadow-glow: 0 0 0 1px rgba(124, 92, 255, 0.15), 0 8px 30px -8px rgba(124, 92, 255, 0.35);
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 12px 32px -16px rgba(0, 0, 0, 0.6);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background:
+    radial-gradient(1200px 600px at 90% -10%, rgba(124, 92, 255, 0.16), transparent 60%),
+    radial-gradient(900px 500px at -10% 10%, rgba(62, 230, 216, 0.08), transparent 55%),
+    var(--color-base-950);
+  color: var(--color-base-100);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(124, 92, 255, 0.35);
+  color: #fff;
+}
+
+/* Slim, unobtrusive scrollbars that still fit the dark theme. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-base-600) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-base-600);
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  .glass-card {
+    @apply rounded-2xl border border-white/5 bg-base-900/60 backdrop-blur-xl;
+    box-shadow: var(--shadow-card);
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium
+           transition-all duration-150 select-none disabled:opacity-50 disabled:pointer-events-none
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium
+           transition-all duration-150 select-none disabled:opacity-50 disabled:pointer-events-none
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60 text-white;
+    background: linear-gradient(135deg, var(--color-brand-500), var(--color-brand-700));
+    box-shadow: var(--shadow-glow);
+  }
+  .btn-primary:hover {
+    filter: brightness(1.08);
+    transform: translateY(-1px);
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium
+           transition-all duration-150 select-none disabled:opacity-50 disabled:pointer-events-none
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60
+           border border-white/10 bg-white/[0.03] text-base-100 hover:bg-white/[0.07];
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium
+           transition-all duration-150 select-none disabled:opacity-50 disabled:pointer-events-none
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60
+           text-base-300 hover:bg-white/[0.05] hover:text-base-100;
+  }
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium
+           transition-all duration-150 select-none disabled:opacity-50 disabled:pointer-events-none
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/60
+           border border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/20;
+  }
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+
+  .input {
+    @apply w-full rounded-xl border border-white/10 bg-white/[0.03] px-3.5 py-2.5 text-sm text-base-100
+           placeholder:text-base-400 outline-none transition-colors
+           focus:border-brand-500/60 focus:bg-white/[0.05];
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-medium uppercase tracking-wider text-base-400;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium;
+  }
+  .badge-neutral { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium border-white/10 bg-white/5 text-base-300; }
+  .badge-blue { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium border-sky-500/25 bg-sky-500/10 text-sky-300; }
+  .badge-emerald { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium border-emerald-500/25 bg-emerald-500/10 text-emerald-300; }
+  .badge-amber { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium border-amber-500/25 bg-amber-500/10 text-amber-300; }
+  .badge-rose { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium border-rose-500/25 bg-rose-500/10 text-rose-300; }
+  .badge-violet { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium border-violet-500/25 bg-violet-500/10 text-violet-300; }
+
+  .table-shell {
+    /* overflow-x-auto, not overflow-hidden. Six pages put wide tables in
+       this wrapper (Files, Triage, Audit Log, Documents, Users, Rename
+       Proposals); with overflow hidden, any viewport too narrow for the full
+       column set silently CLIPPED the right-hand columns -- including the
+       action buttons -- with no scrollbar to reveal them. Scrolling the
+       table inside its own box also keeps the page body from scrolling
+       sideways, which is the thing that actually feels broken. */
+    @apply overflow-x-auto rounded-2xl border border-white/5;
+  }
+  .table-row-hover {
+    @apply transition-colors hover:bg-white/[0.03];
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-base-300
+           transition-all duration-150 hover:bg-white/[0.05] hover:text-base-100;
+  }
+  .nav-link-active {
+    @apply flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium
+           transition-all duration-150 text-white;
+    background: linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(124, 92, 255, 0.06));
+    box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.3);
+  }
+}
+
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in-up {
+  animation: fade-in-up 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-pulse-soft {
+  animation: pulse-soft 1.8s ease-in-out infinite;
+}

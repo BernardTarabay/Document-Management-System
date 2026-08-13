@@ -1,0 +1,6 @@
+node_modules/
+dist/
+out/
+# Never commit a real agent credential.
+agent-config.json
+*.log

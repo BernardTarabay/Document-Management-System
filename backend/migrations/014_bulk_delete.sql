@@ -1,0 +1,11 @@
+-- "Remove all files" bulk action. Repository-wide operations are always
+-- represented as a job (docs/08-api-contracts.md conventions), never a
+-- synchronous request, so this needs its own job_type value the same way
+-- bulk_rename does.
+--
+-- ADD VALUE IF NOT EXISTS is safe inside migrate.js's per-migration
+-- transaction on Postgres 12+ (the restriction on ALTER TYPE ... ADD VALUE
+-- running in a transaction was lifted then) as long as the new value isn't
+-- used in the SAME transaction, which it isn't -- this migration only adds
+-- the value, nothing inserts a row using it here.
+ALTER TYPE job_type ADD VALUE IF NOT EXISTS 'bulk_delete';

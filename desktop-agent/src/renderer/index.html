@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- No remote content, no inline event handlers, no eval. The agent
+         window renders local status only. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:;"
+    />
+    <title>Filesystem Agent</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Filesystem Agent</h1>
+      <span id="status-pill" class="pill pill-offline">Disconnected</span>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Connection</h2>
+        <p class="hint">
+          Register this agent in the web app under <strong>Storage Locations &rarr; Agents</strong>.
+          The API key is shown once at registration and cannot be retrieved afterwards.
+        </p>
+
+        <label for="serverUrl">Server URL</label>
+        <input id="serverUrl" type="url" placeholder="http://localhost:5000" autocomplete="off" />
+
+        <label for="agentId">Agent ID</label>
+        <input id="agentId" type="text" placeholder="uuid from registration" autocomplete="off" />
+
+        <label for="apiKey">API key</label>
+        <input id="apiKey" type="password" placeholder="leave blank to keep the stored key" autocomplete="off" />
+
+        <label for="pollInterval">Poll interval (seconds)</label>
+        <input id="pollInterval" type="number" min="1" max="300" value="5" />
+
+        <div class="row">
+          <button id="save" type="button">Save</button>
+          <button id="connect" type="button" class="primary">Connect</button>
+          <button id="disconnect" type="button">Disconnect</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Registered directories</h2>
+        <p class="hint">
+          Directories this agent may operate on, relative to the storage location's root path.
+          Leave the list empty to allow the entire root. The server enforces this too &mdash;
+          it is checked on both sides.
+        </p>
+        <ul id="directories" class="dirs"></ul>
+        <div class="row">
+          <button id="addDir" type="button">Add directory&hellip;</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Activity</h2>
+        <dl class="stats">
+          <div><dt>Location</dt><dd id="stat-location">&mdash;</dd></div>
+          <div><dt>Root path</dt><dd id="stat-root">&mdash;</dd></div>
+          <div><dt>Last poll</dt><dd id="stat-poll">&mdash;</dd></div>
+          <div><dt>Succeeded</dt><dd id="stat-ok">0</dd></div>
+          <div><dt>Failed</dt><dd id="stat-fail">0</dd></div>
+        </dl>
+        <ul id="events" class="events"></ul>
+      </section>
+    </main>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
