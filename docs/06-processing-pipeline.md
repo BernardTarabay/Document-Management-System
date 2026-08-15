@@ -36,6 +36,7 @@ metadata extraction, classification, or naming.
 | Duplicate detection (probable) | `detect_duplicates` with `phase: 'probable'` | `file_content.extracted_text` | `duplicate_groups` (type `probable`, always OPEN) | Yes — content similarity, MEDIUM confidence ceiling, never auto-resolved |
 | Version detection | `detect_versions` | filenames + `file_content.extracted_text` | `audit_logs` (`version.suggested`) — **not** `document_versions` | Yes — suggestion only; writing a version row is a human action (docs/01 §1.3) |
 | Naming proposal | `generate_names` | `documents`, `subjects`, `document_types`, taxonomy | `rename_proposals` | Yes |
+| Description | `describe` | whichever evidence the file offers — `file_content`, `file_ocr`, the image, the video/audio, or failing all of those the file's own facts | `file_descriptions` (+ mirrored into `files.ai_summary`) | Yes — see §6.8 |
 | Human review | (no job — UI/API) | `rename_proposals`, `classification_results` | approval/rejection status | Phase 9/11 |
 | Filesystem operation | `bulk_rename` | Approved proposals | physical file + `files.current_path` | yes -- a proposal can rename, move (`proposed_relative_dir`), or both; `bulk_move` as a separate job type was superseded by this and still has no processor |
 | Reprocessing | `reindex` | existing `files` rows | re-enqueues extraction/classification/naming stages | Yes — re-runs analysis without re-walking the filesystem |
@@ -143,3 +144,65 @@ access — used when the backend host can already reach the Storage Location). T
 work; the interface is already shaped to accommodate it without changing any job
 processor.
 
+## 6.8 Description — how a file becomes findable by describing it
+
+Every other stage answers "what should this file be called and where does it
+belong". This one answers "what IS it", in a sentence a person could recognise it
+by, and it runs for every file — including the ones no other stage can say anything
+about.
+
+### Where the description comes from
+
+The stage picks the most direct evidence the file actually offers, in this order:
+
+| `source` | Evidence | Cost |
+|---|---|---|
+| `inherited` | a byte-identical twin was already described | none — checked first, before anything else |
+| `image` | the vision model looked at the picture | usually already paid for on the OCR path and adopted, not re-requested |
+| `video` / `audio` | the multimodal model watched or listened | one call; video is billed by duration, so `AI_MEDIA_MAX_BYTES` caps it |
+| `document_text` | a summary of text the document contained | reuses the classifier's summary where that ran |
+| `ocr_text` | a summary of text OCR recovered from a scan | one call |
+| `metadata` | **nothing could read it** — built from facts, with no model involved | none |
+| `failed` | the stage ran and could not produce one; `failure_reason` says why | — |
+
+`metadata` is the one that matters most for honesty. A ZIP, an encrypted PDF or a
+format with no extractor gets a description assembled in code from things that are
+true by construction — the type, the size, the folder it sits in, the date, and the
+words that are literally in its filename — and it says plainly that the contents were
+not read. A model is never asked to guess what a file contains from its name. That is
+`textQuality.js`'s rule, and it binds harder here: a description is not only
+displayed, it is embedded, so a confident invention becomes what search matches on
+forever.
+
+### Where it is enqueued from
+
+- `hashProcessor` — for photos when OCR will not run, and for audio/video
+- `ocrService` — at the end of a scan's OCR pass, so it can adopt what the vision
+  model already said
+- `classifyProcessor` — for documents, **after** classification, so it can adopt the
+  AI tier's summary rather than paying for a second one
+
+### It does not move a file through the lifecycle
+
+`describe` marks a file `processing` on the way in and puts it back in the state it
+found it in on the way out. Describing a photo does not file it; describing a
+document sitting in triage does not resolve it. Only a file that was genuinely
+mid-pipeline (`discovered`/`processing`) is completed. Marking everything `completed`
+here would silently empty the triage queue and the Photos backlog — the bounce
+migration 032's state machine exists to prevent, running in reverse.
+
+### Search
+
+`file_descriptions` carries both halves of retrieval: the same four-configuration
+multilingual `tsvector` migration 020 built for extracted text, and a 768-dimension
+embedding stored as `bytea` (little-endian float32, L2-normalised on write, so cosine
+similarity is a dot product). `descriptionSearchService` runs three signals — semantic,
+lexical-over-descriptions, and the existing content/filename search — and fuses them
+with reciprocal rank fusion, because their raw scores are on incomparable scales and
+only the ORDER each produces is meaningful.
+
+No pgvector: it is not available on this installation, and at ~9,400 files a brute-force
+scan over cached `Float32Array`s is single-digit milliseconds. See migration 035.
+
+Backfill for files that predate the stage: `node scripts/backfill-descriptions.js`.
+Proof it works end to end: `node scripts/verify-descriptions.js`.

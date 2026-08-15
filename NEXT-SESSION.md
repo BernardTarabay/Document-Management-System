@@ -67,6 +67,23 @@ Landed since, not from the numbered list:
   (a real reset left 15,759 jobs in Redis grinding against truncated tables),
   sweeps rows written by jobs that were mid-flight, and removes the mirror's
   shortcuts (only `.lnk`/`.url`, never anything else a user put there).
+- **Every file has a description, and you can find it by describing it.**
+  New `describe` stage (migrations 034/035, `services/descriptionService.js`).
+  `files.ai_summary` existed but was a by-product of classification, so it was
+  missing wherever the AI tier had not run, and it was only searchable by
+  `ILIKE '%<your whole phrase>%'` — the entire query had to appear verbatim.
+  Now: every active file ends with a `file_descriptions` row carrying either a
+  description or a written reason it has none. Videos and audio are described
+  for real (Gemini is multimodal — the two WhatsApp clips came back as "a child
+  cheering at a soccer match" and "a person in an Argentina jersey dancing").
+  Files nothing can read get a facts-only description, built in code with no
+  model involved, that says so rather than inventing contents.
+  Search fuses three signals (meaning, description wording, existing
+  content/filename) with reciprocal rank fusion. No pgvector — it is not
+  available on this Postgres and is not needed at this size; 768-dim vectors
+  live in `bytea` and are scanned in memory in single-digit ms.
+  `node scripts/verify-descriptions.js`, `node scripts/backfill-descriptions.js`.
+
 Also open:
 
 - **Task #46 — 93 mirror shortcuts fail on Windows MAX_PATH.** WScript.Shell
@@ -125,6 +142,7 @@ bugs after a change looked fine:
     node scripts/verify-duplicate-compare.js    duplicate group inspect/compare
     node scripts/verify-search-filters.js       filters on all four query paths
     node scripts/verify-known-content-skip.js   2nd overlapping folder is cheap
+    node scripts/verify-descriptions.js         every file describable + findable
 
 The four newest scripts PAUSE the BullMQ queues while they set fixtures up
 (scripts/_fixtureQueue.js) and resume on the way out. Without that a live

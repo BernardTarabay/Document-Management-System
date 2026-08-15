@@ -33,6 +33,8 @@ const pipelineState = require("../pipelineState");
 const imageDescriber = require("../ai/imageDescriber");
 const subjectRepository = require("../../repositories/subjectRepository");
 const auditLogRepository = require("../../repositories/auditLogRepository");
+const { enqueueJob } = require("../../queues");
+const { JobType } = require("../../models/enums");
 const env = require("../../config/env");
 
 /**
@@ -223,6 +225,18 @@ async function runForFile(fileId, { languages, force = false } = {}) {
             : "OCR found very little text. Have a look at the image and name it yourself if needed."
       );
     }
+
+    // Hand off to the describe stage last, once both halves of "what is this
+    // image?" are on record.
+    //
+    // It is enqueued rather than called: it needs no bytes (it adopts the
+    // description written just above, or summarises the OCR text for a
+    // rasterised document) and its real work is the embedding, which is a
+    // second network call this job should not wait on. It runs for scanned
+    // DOCUMENTS too, not only photos -- OCR text is the only readable thing
+    // such a file has, and without this pass it would never be described.
+    await enqueueJob(JobType.DESCRIBE, { fileId }, { storageLocationId: file.storage_location_id })
+      .catch((err) => console.warn(`[ocr] could not queue describe for ${fileId}: ${err.message}`));
 
     return {
       ok: true, fileId, confidence, pageCount: pages.length,

@@ -53,7 +53,7 @@ a new concept.
 
 | Method | Path | Permission | Notes |
 |---|---|---|---|
-| GET | `/` | `document.view` | Query: `q` (searches content, AI title/summary and filename; `mode=filename` for name-only), `status`, `limit`, `offset`, plus the filters below |
+| GET | `/` | `document.view` | Query: `q`, `status`, `limit`, `offset`, plus the filters below. `q` searches filenames, document contents, and each file's stored description — the last both by wording and by **meaning**, so describing a file in your own words finds it (see "Describing a file to find it" below). `mode=filename` for name-only; `mode=content` for the pre-description ranking |
 | GET | `/count` | `document.view` | `{ count }` for the same filters, repository-wide. Refuses a `q` — see below |
 | GET | `/filter-options` | `document.view` | What is actually there to filter by: `extensions` (with counts, including a `none` bucket), `locations`, and `dateRange` (`earliest`, `latest`, `undated`) |
 | GET | `/:id` | `document.view` | Joins metadata, content length, latest classification, duplicate-group membership |
@@ -64,6 +64,31 @@ a new concept.
 | DELETE | `/:id` | `document.delete` | Marks `deleted`, doesn't erase from disk |
 | DELETE | `/remove-all` | `document.delete` | Background job; marks every file deleted |
 | POST | `/:id/reveal` | `document.download` | Spawns the host OS's native file manager with the file selected (`explorer.exe /select,`, `open -R`, or `xdg-open` on the containing folder as a Linux fallback). Only works when this backend process is itself running on the desktop machine being browsed from, and only for `direct`-access-mode storage locations -- 400s otherwise. Sends no bytes over the network; see `fileService.revealInFileManager`. |
+
+### Describing a file to find it
+
+`GET /files?q=...` accepts a description, not just keywords. "the photo of a kid
+blowing out birthday candles" finds a file whose stored description reads "a child at
+a party with a cake", and an English phrase finds a French or Arabic document, because
+the query and every description are compared as embeddings rather than as words. See
+`docs/06-processing-pipeline.md` §6.8 for where descriptions come from — every file
+has one, including photos, videos and audio recordings, which have no text at all.
+
+Each result row carries how it was found, so the UI can say why something matched
+rather than presenting an unexplained hit:
+
+| Field | Meaning |
+|---|---|
+| `matched_by` | Which signals fired: `semantic` (by meaning), `description` (words in its description), `content` (the document's text, its filename or its AI title) |
+| `match_reasons` | The same thing in plain language, ready to render |
+| `similarity` | 0–1 cosine similarity for a semantic hit, `null` otherwise. Note this model's floor is high — unrelated text still scores ~0.55, and the search will not return anything below `DESCRIPTION_SEARCH_MIN_SIMILARITY` (default 0.62) |
+| `rank` | The fused score results are ordered by. Not comparable across queries |
+
+The response is still a **bare array** — several callers already consume that shape.
+Whether the semantic half actually ran is reported in the `X-Search-Mode` response
+header (`hybrid` or `lexical`); `lexical` means Gemini was unreachable or no API key is
+set, so paraphrase matching was unavailable for that request and the results are
+keyword-only. Search degrades rather than failing.
 
 ### Search filters
 

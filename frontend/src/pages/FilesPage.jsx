@@ -324,14 +324,15 @@ export function FilesPage() {
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-base-400" />
           <input
             className="input pl-9"
-            placeholder="Search names and file contents…"
+            placeholder="Search, or just describe the file…"
             value={q}
             onChange={(e) => { setQ(e.target.value); setOffset(0); }}
           />
         </div>
         {q && (
           <p className="text-xs text-base-500">
-            Searching inside documents too — French, Arabic, Hebrew and English.
+            Names, contents and descriptions — describing a file in your own words works,
+            in French, Arabic, Hebrew or English.
           </p>
         )}
       </div>

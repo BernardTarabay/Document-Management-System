@@ -3,7 +3,16 @@ const mime = require("../utils/mimeGuess");
 const { buildContentDisposition } = require("../utils/contentDisposition");
 
 async function list(req, res) {
-  res.json(await fileService.search(req.query, req.user.id));
+  const files = await fileService.search(req.query, req.user.id);
+
+  // Which signals actually ran, without changing the response body -- the body
+  // is a bare array that several callers already consume. "lexical" means the
+  // semantic half could not run (no API key, or Gemini was unreachable), so
+  // paraphrase matching is unavailable for this request and the UI can say so
+  // rather than leaving the user to conclude the file is not there.
+  if (files?.searchMode) res.set("X-Search-Mode", files.searchMode);
+
+  res.json(files);
 }
 
 async function count(req, res) {

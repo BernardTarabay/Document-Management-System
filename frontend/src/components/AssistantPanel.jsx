@@ -324,6 +324,11 @@ export function AssistantPanel() {
             subjectId: f.subject_id || null,
             subjectName: f.subject_name || null,
             snippet: f.snippet || null,
+            // What this file IS. For a photo, a video or a scan there is no
+            // snippet to show -- the description is the only thing that tells
+            // the user whether this is the one they meant.
+            description: f.ai_summary || null,
+            matchReasons: f.match_reasons || [],
           })),
         });
       } else {
@@ -488,7 +493,22 @@ function FoundFiles({ matches, onReveal }) {
               <span className="shrink-0 text-[10px] text-base-600">not filed yet</span>
             )}
           </div>
-          {m.snippet && <SearchSnippet snippet={m.snippet} />}
+          {/* The snippet is the stronger evidence when there is one -- it is
+              the document's own words. The description is what a photo, a
+              video or an unreadable scan has instead, so it is shown when
+              there is no snippet rather than alongside it. */}
+          {m.snippet ? (
+            <SearchSnippet snippet={m.snippet} />
+          ) : m.description ? (
+            <p dir="auto" className="mt-1 line-clamp-2 text-[10px] leading-snug text-base-400">
+              {m.description}
+            </p>
+          ) : null}
+          {m.matchReasons?.length > 0 && (
+            <p className="mt-1 text-[9px] uppercase tracking-wide text-base-600">
+              matched its {m.matchReasons.join(" and ")}
+            </p>
+          )}
         </div>
       ))}
     </div>

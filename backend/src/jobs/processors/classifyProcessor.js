@@ -267,6 +267,9 @@ async function handle({ fileId }) {
     // itself and no-ops if it's still low confidence, so it's always safe
     // to enqueue here rather than duplicating that decision.
     await enqueueJob(JobType.GENERATE_NAMES, { fileId }, {});
+    // Describing happens after classification, not before, so it can adopt the
+    // AI tier's summary where that ran instead of paying for a second one.
+    await enqueueJob(JobType.DESCRIBE, { fileId }, {});
 
     return { classificationResultId: result.id, confidenceLevel: "low" };
   }
@@ -305,6 +308,7 @@ async function handle({ fileId }) {
   }
 
   await enqueueJob(JobType.GENERATE_NAMES, { fileId }, {});
+  await enqueueJob(JobType.DESCRIBE, { fileId }, {});
 
   return { classificationResultId: result.id, confidenceLevel };
 }

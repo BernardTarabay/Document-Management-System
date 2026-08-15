@@ -156,6 +156,15 @@ async function handle({ fileId }) {
       ocrQueued = true;
     }
 
+    // Only when OCR is NOT going to run. The OCR stage already asks the vision
+    // model what the picture shows and enqueues `describe` itself when it
+    // finishes, so queueing it here as well would race: two jobs would reach
+    // the "no description yet" check at the same moment and both pay for the
+    // same vision call.
+    if (!ocrQueued) {
+      await enqueueJob(JobType.DESCRIBE, { fileId }, { storageLocationId: storageLocation.id });
+    }
+
     // NEEDS_USER, not COMPLETED: a photograph nobody has looked at is exactly
     // the thing waiting on a person. It shows in Photos as unreviewed, and
     // filing it or keeping its name clears it. It is deliberately NOT in the
@@ -166,8 +175,14 @@ async function handle({ fileId }) {
   }
 
   if (route === "media") {
-    // Audio/video: indexed and filable, but there is no text in it and none
-    // will be invented. Saying so is more useful than four failed stages.
+    // Audio/video: still no TEXT to extract, and none will be invented. But
+    // there is now something to be said about it -- the describe stage watches
+    // the video or listens to the recording and writes down what it contains,
+    // which is what makes "the clip of the kid at the football match" findable
+    // instead of leaving the user with "WhatsApp Video 2026-07-16 at
+    // 00.16.15.mp4" and no way in.
+    await enqueueJob(JobType.DESCRIBE, { fileId }, { storageLocationId: storageLocation.id });
+
     await pipelineState.markNeedsUser(
       fileId, "hash",
       "Audio or video -- there is no text to extract, so Atlas cannot name or classify it. File it yourself."

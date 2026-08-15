@@ -1,10 +1,36 @@
 # Document Management & Intelligent File Organization Platform
 
+Point a folder at it and it works out what everything is, files it, proposes better
+names, and lets you find any of it again by describing it from memory. Original files
+are never renamed, moved or deleted — canonical names live in the database and the
+organized view is a disposable tree of shortcuts.
+
 Status: **Phases 1–12 complete** (Domain Analysis → Terminology → Taxonomy →
 Storage Architecture → Database Model → Processing Pipeline → Background Jobs →
 Auth/RBAC → API Contracts → Controllers/Services/Routes → React Frontend →
-Electron Filesystem Agent), plus several post-Phase-11 additions:
+Electron Filesystem Agent), plus substantial post-Phase-11 work:
 
+- **Find a file by describing it** (`docs/06 §6.8`) — every file gets a plain-language
+  description of what it *is*, and search matches that description by **meaning**, not
+  just words. "the photo of a kid blowing out birthday candles" finds a picture whose
+  description reads "a child at a party with a cake", and an English phrase finds a
+  French or Arabic document. Photos are described by a vision model, videos and audio
+  are actually watched and listened to, and files nothing can read get a facts-only
+  description that says so rather than inventing contents.
+- **Per-user ownership** (migration 028) — ownership is in the schema and every
+  repository read is scoped by it, not filtered at the route layer. Verified by
+  `scripts/verify-ownership.js`.
+- **A real file lifecycle** (migration 032) — pipeline position is recorded rather
+  than inferred from four different predicates, with per-stage retry counts, so a
+  retried file can be proven to be making progress instead of silently bouncing back
+  into triage forever.
+- **OCR** (`services/ocr/`) — scans and photographs are read, with a confidence floor
+  below which the text is shown but never used to name a document.
+- **Devices and replicas** (migration 030) — organization is cross-device; file
+  *content* is not, and that gap is now modelled explicitly instead of papered over.
+- **A taxonomy that can grow** (migration 029) — no longer a fixed three levels, and
+  folders the assistant proposed are marked as its idea rather than presented as
+  yours.
 - **AI classification escalation tier** (`docs/09-ai-classification.md`) — when the
   rule-based classifier isn't confident and `GEMINI_API_KEY` is set, a Gemini pass
   produces a specific title, one-line summary and extracted entities. Entirely
@@ -15,7 +41,9 @@ Electron Filesystem Agent), plus several post-Phase-11 additions:
   match, as reviewable suggestions that are never auto-applied.
 - **Legacy Office extraction** — `.doc`/`.xls`/`.ppt` are now fully extracted.
 
-Phase 13 (integration) and Phase 14 (broader testing) are next.
+Everything AI here is optional. With no `GEMINI_API_KEY` the rule-based classifier,
+the full pipeline and keyword search all work exactly as before; description search
+degrades to keyword-only rather than failing.
 
 ## What's here
 
@@ -33,9 +61,10 @@ docs/
   10-email-inbox.md           Gmail triage design
 
 backend/
-  migrations/     17 numbered, forward-only SQL files
+  migrations/     35 numbered, forward-only SQL files. Each one opens with why it
+                  exists -- these are the best explanation of the design decisions
   seeds/          Reference data (RBAC roles/permissions, starter taxonomy)
-  scripts/        verify-agent-e2e.js -- live end-to-end check of the agent protocol
+  scripts/        19 verify-*.js live end-to-end checks against real Postgres/Redis
   tests/          node --test, no new dependencies (see tests/README.md)
   src/
     config/       env validation, pg Pool, Redis connection
@@ -47,9 +76,19 @@ backend/
                     + AgentStorageService (brokered through a Filesystem Agent)
       extraction/   per-format extractors (pdf/xlsx/docx/pptx/pbix)
                     + ole/ for legacy .doc/.xls/.ppt
+                    + textQuality.js -- decides whether extracted text is usable
+                    at all, which gates naming, classification and description
+      ocr/          engine detection, PDF rasteriser, and the OCR pass itself
       email/        Gmail OAuth and API client (raw fetch, no SDK)
-      ai/           geminiClassifier, geminiChatService, emailTriageClassifier
+      ai/           geminiClassifier, geminiChatService, emailTriageClassifier,
+                    imageDescriber (what a picture shows), mediaDescriber (video
+                    and audio), textSummariser, embeddingService (search vectors),
+                    rateLimiter -- ONE outgoing-call budget shared by all of them
       preview/      LibreOffice-backed thumbnails
+      descriptionService.js        every file gets a description, from whichever
+                                   evidence it offers
+      descriptionSearchService.js  meaning + wording + content, fused by RRF
+      pipelineState.js             the file lifecycle as an explicit state machine
       similarityService.js  shingle/Jaccard engine for duplicates + versions
       agentService.js       Filesystem Agent lifecycle and operation brokering
       hashingService.js, namingService.js, authService.js, and one service
@@ -62,21 +101,23 @@ backend/
     routes/       one file per resource, mounted in app.js under /api/*
     queues/       BullMQ registry + enqueueJob() (always backed by a processing_jobs row)
     jobs/         job_type -> processor registry, runProcessingJob() lifecycle wrapper
-      processors/ scan, hash, extract_metadata, extract_text, classify,
-                  detect_duplicates, detect_versions, generate_names,
+      processors/ scan, hash, extract_metadata, extract_text, classify, ocr,
+                  describe, detect_duplicates, detect_versions, generate_names,
                   bulk_rename, bulk_delete, auto_resolve_duplicates,
-                  email_sync, reindex
+                  email_sync, sync_mirror, reindex
     workers/      runner.js -- separate worker process, `npm run worker`
 
 frontend/         React 18 + Vite + Tailwind v4 SPA
   src/
     services/apiClient.js   thin fetch wrapper, attaches JWT, retries once on 401
     context/                AuthContext, ToastContext
-    components/             Sidebar, Topbar, Layout, Modal, ConfirmDialog, preview
-                            and folder-import components, SubjectChatPanel, ...
-    pages/                  Login, Register, Dashboard, Files, Documents, Subjects,
-                            DuplicateGroups, RenameProposals, ProcessingJobs,
-                            StorageLocations, AuditLog, Users, Inbox
+    components/             TopNav, Layout, Modal, ConfirmDialog, preview and
+                            folder-import components, AssistantPanel, SearchSnippet,
+                            MoveFileModal / MoveManyModal, DuplicateFindings, ...
+    pages/                  Login, Register, Dashboard, Files, Photos, Documents,
+                            Subjects, Triage, DuplicateGroups, RenameProposals,
+                            ProcessingJobs, StorageLocations, Devices, AuditLog,
+                            Users, Inbox
 
 desktop-agent/    Electron Filesystem Agent (Phase 12) -- see its own README
   src/            main/preload/renderer + the poll-execute-report runner
@@ -95,8 +136,12 @@ npm run db:migrate           # applies backend/migrations/*.sql
 npm run db:seed              # loads backend/seeds/*.sql (idempotent)
 
 npm run dev                  # terminal 1: API on :5000, GET /api/health checks the DB
-npm run worker               # terminal 2: starts all 13 job workers against Redis
+npm run worker               # terminal 2: starts every job worker against Redis
 ```
+
+**`npm run dev` only watches the API.** The worker is not under nodemon, so after
+changing anything it runs — extraction, OCR, classification, naming, description —
+restart it by hand or it keeps running the old code.
 
 ```bash
 cd frontend
@@ -127,27 +172,59 @@ curl -X POST http://localhost:5000/api/storage-locations \
 
 curl -X POST http://localhost:5000/api/storage-locations/<id>/scan \
   -H "Authorization: Bearer <token>"
-# -> discovers files, which cascade through hash -> metadata/text extraction ->
-#    duplicate + version detection -> classification -> naming proposal
+# -> discovers files, which cascade through hash -> metadata/text extraction (or
+#    OCR for scans and photos) -> duplicate + version detection -> classification
+#    -> naming proposal -> description
+```
+
+Then find something without knowing what it is called:
+
+```bash
+curl -G http://localhost:5000/api/files \
+  -H "Authorization: Bearer <token>" \
+  --data-urlencode "q=the photo of a kid blowing out birthday candles"
+# -> each result carries match_reasons ("by meaning" / "in its description" /
+#    "in content") and, for a semantic hit, a 0-1 similarity
+```
+
+Files that predate the describe stage need one backfill pass:
+
+```bash
+cd backend && node scripts/backfill-descriptions.js
 ```
 
 ## Tests
 
 ```bash
-cd backend && npm test          # 138 tests
+cd backend && npm test          # 281 tests
 cd desktop-agent && npm test    # 16 tests
 ```
 
 Node's built-in runner, no new dependencies. All pure unit tests — no live Postgres,
-Redis or network — so they run in under a second and can't fail for environmental
+Redis or network — so they run in about a second and can't fail for environmental
 reasons. `backend/tests/README.md` explains what's covered, what deliberately isn't
 (the AI tiers, repositories, the job pipeline, the frontend), and why.
 
-Two live end-to-end checks need real services:
+Beyond those, 19 `verify-*` scripts drive the real services, because the bugs that
+matter most here are silent: a query missing its owner predicate, a search that
+returns confident nonsense, a retried file that quietly returns to triage. None of
+those throw, so only an end-to-end assertion catches them.
 
 ```bash
-cd backend && npm run verify:agent   # full Filesystem Agent loop against a real DB
+cd backend
+node scripts/verify-ownership.js            # two accounts, zero leakage
+node scripts/verify-descriptions.js         # every file describable and findable
+node scripts/verify-triage.js               # the triage queue's reasons
+node scripts/verify-duplicate-compare.js    # duplicate group inspect/compare
+node scripts/verify-search-filters.js       # filters agree across all four query paths
+node scripts/verify-known-content-skip.js   # a second overlapping folder is cheap
+npm run verify:agent                        # full Filesystem Agent loop
 ```
+
+The newer scripts pause the BullMQ queues while they set fixtures up
+(`scripts/_fixtureQueue.js`) and resume on the way out — without that, a live worker
+processes the fixtures out from under the assertions. Run the older ones with the
+worker stopped.
 
 ## What was verified against real services
 
@@ -178,6 +255,21 @@ PostgreSQL and Redis, not mocks:
 - The Filesystem Agent protocol was verified end-to-end (`npm run verify:agent`):
   every operation type through `AgentStorageService`, plus confirmation that path
   traversal and out-of-scope paths are refused on both sides.
+- Per-user isolation was verified with two real accounts driving the real services
+  (`verify-ownership.js`), because an unscoped query returns another account's rows
+  with no error, no empty list and no 403 — it looks exactly like the feature working.
+- The Gemini request/response shapes were established by calling the live API and
+  trying the alternatives, not by reading for them. This mattered: referencing an
+  uploaded video from the Interactions endpoint takes `uri`, while the documented-
+  looking `file_uri` and `file_data: { file_uri }` are both rejected outright. Same
+  for the embedding model — its 768-dimension output comes back *un-normalised*
+  (measured ‖v‖ = 0.59), so anything comparing those vectors without normalising
+  first is ranking partly by vector length.
+- Description search was validated against real content: a rough phrase sharing
+  almost no words with a description finds the right file (0.74–0.79), a French
+  description matches an English query (0.72), and a phrase matching nothing returns
+  nothing rather than the closest thing — the case that catches a broken threshold,
+  since two unrelated texts still score ~0.55 with this model.
 
 ## Frontend verification
 
@@ -206,7 +298,24 @@ PostgreSQL and Redis, not mocks:
 - **The desktop agent has no installer**, no code signing and no auto-update, and
   transfers file bytes base64-encoded in one operation result (64 MB cap) rather than
   in chunks. See `desktop-agent/README.md`.
-- **The AI tiers have no automated tests** — they need a live `GEMINI_API_KEY`. Only
-  the free rule tiers are unit-tested.
+- **The AI tiers have no unit tests** — they need a live `GEMINI_API_KEY`. Only the
+  free rule tiers are unit-tested; the paid paths are covered by the `verify-*`
+  scripts instead, which is a deliberate trade rather than an oversight.
 - **pbix data models are not parsed** — the xVelocity blob would need the Analysis
   Services engine (docs/07).
+- **Plain text has no extractor.** `.txt`, `.csv`, `.md`, `.json` and `.xml` are not
+  registered in `services/extraction/index.js`, so their text is never read — they
+  are invisible to content search and fall back to a facts-only description. The
+  easiest format in the archive is the one that is missing.
+- **Description search does not apply inside a subject branch.** Searching from the
+  Subjects page still uses the older content-only ranking; only the Files page and
+  the assistant get meaning-matching.
+- **`pipelineState.markNeedsUser` discards its reason.** `transition()` only persists
+  `failure_reason` for the two failure states, so the specific "why does this need
+  me" messages never reach the database and the UI shows a generic fallback.
+- **Video and audio description is capped by file size** (`AI_MEDIA_MAX_BYTES`,
+  default 200 MB) as a proxy for duration, since video is billed per second of
+  content. Longer recordings get a facts-only description.
+- **93 mirror shortcuts fail on Windows MAX_PATH** — `WScript.Shell` refuses paths
+  over 260 characters. Needs either a canonical-name length cap or `\\?\` extended
+  paths.

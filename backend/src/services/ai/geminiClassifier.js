@@ -105,62 +105,13 @@ function truncate(text, max) {
   return text.length > max ? `${text.slice(0, max)}\n[...truncated...]` : text;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// --- Client-side rate limiting -----------------------------------------
-// Paces outgoing calls to stay under env.ai.rateLimitPerMinute instead of
-// firing bursts and letting Google reject the overflow with 429s. A sliding
-// window of recent call timestamps; a call waits for a free slot rather
-// than being denied one. Acquisition itself is serialized through a single
-// promise chain -- without that, several concurrent callers (the classify
-// queue's worker concurrency) could all see the same "under the limit"
-// snapshot and all proceed at once, which defeats the point.
-const callTimestamps = [];
-let rateLimitChain = Promise.resolve();
-
-function acquireRateLimitSlot() {
-  rateLimitChain = rateLimitChain.then(async () => {
-    const limit = env.ai.rateLimitPerMinute;
-    if (!limit || limit <= 0) return; // 0/unset = no client-side pacing
-    const windowMs = 60_000;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const now = Date.now();
-      while (callTimestamps.length && now - callTimestamps[0] >= windowMs) {
-        callTimestamps.shift();
-      }
-      if (callTimestamps.length < limit) {
-        callTimestamps.push(now);
-        return;
-      }
-      await sleep(callTimestamps[0] + windowMs - now + 50);
-    }
-  });
-  // A rejected link would poison the chain permanently: every later
-  // .then() on it inherits the rejection, so one failure inside the block
-  // above would mean acquireRateLimitSlot() rejects forever for the life of
-  // the process -- and since classifyProcessor catches everything around the
-  // AI tier, that would silently disable AI classification with no error
-  // anyone would see. Keep the CHAIN resolved; hand the caller the real
-  // outcome.
-  const acquired = rateLimitChain;
-  rateLimitChain = rateLimitChain.then(
-    () => {},
-    () => {}
-  );
-  return acquired;
-}
-
-// Google's 429 body includes a human-readable hint like "Please retry in
-// 25.054123681s." -- honor that instead of guessing, so a retry doesn't
-// fire early and get rejected again.
-function parseRetryDelayMs(bodyText) {
-  const match = /retry in ([\d.]+)s/i.exec(bodyText || "");
-  if (!match) return null;
-  return Math.ceil(parseFloat(match[1]) * 1000) + 500; // small buffer
-}
+// Client-side rate limiting and its 429 retry-hint parser used to live here,
+// private to this module. They now live in ./rateLimiter.js and are SHARED by
+// every Gemini caller in the process -- the classifier, the image and media
+// describers, and the embedder. The behaviour is identical; what changed is
+// that one API key's quota is now paced by one window instead of one per
+// module. See the header of that file.
+const { acquireRateLimitSlot, parseRetryDelayMs, sleep } = require("./rateLimiter");
 
 const MAX_429_RETRIES = 3;
 

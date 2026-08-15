@@ -62,7 +62,7 @@ const RESPONSE_SCHEMA = {
           fileIdB: { type: ["string", "null"], description: "For compare_files -- the second file, from the visible-files list. Must differ from fileIdA." },
           minConfidence: { type: ["number", "null"], description: "For approve_proposals -- only approve pending rename proposals whose confidence score is at or above this, between 0 and 1. If the user says 'above 90%' or 'over 0.9', that is 0.9." },
           maxConfidence: { type: ["number", "null"], description: "For reject_proposals -- discard pending rename proposals whose confidence score is at or BELOW this, between 0 and 1. 'the 0% ones' or 'the useless ones' is 0. 'anything under 20%' is 0.2." },
-          query: { type: ["string", "null"], description: "For find_files -- the search terms to look for, drawn from how the user described the document. Use the meaningful words only (names, numbers, subject matter), not filler like 'the file about'. Keep them in the document's likely language: if the user asks in English for a French contract, search the French words they mention. Quote a phrase to require it verbatim." },
+          query: { type: ["string", "null"], description: "For find_files -- what the user is looking for, as a DESCRIPTION rather than a keyword list. The search matches meaning, not just words, so 'a photo of a child blowing out birthday candles' works better than 'birthday candles' and much better than 'birthday'. Keep the user's own descriptive phrasing, drop only true filler like 'can you find me'. You do NOT need to guess the document's language -- an English description finds a French or Arabic document. Do include any exact names, numbers or reference codes the user gave, since those are matched literally as well." },
         },
         required: ["type", "summary"],
       },
@@ -128,14 +128,24 @@ Action types:
   high-confidence renames", and similar. Approving queues the rename to be applied, so
   this one does need the user's confirmation -- the card will tell them how many match
   before they commit.
-- find_files: search the WHOLE repository for a document the user is describing, by filename
-  and by extracted content. Needs query. This is the one action that is not limited to the
-  visible-files list -- use it whenever the user describes a document rather than naming one
-  you can already see ("find the lease for the Marina site", "where's the invoice from that
-  supplier", "I'm looking for a letter about the roof"). It runs immediately and the results
-  appear in the chat, each one clickable to reveal where that file sits in the subject map.
-  Prefer this over telling the user you cannot find something: search first, then report.
-  If the results look wrong, say so and suggest better terms rather than inventing a match.
+- find_files: search the WHOLE repository for a document the user is describing. Needs query.
+  This is the one action that is not limited to the visible-files list -- use it whenever the
+  user describes a document rather than naming one you can already see ("find the lease for
+  the Marina site", "where's the invoice from that supplier", "I'm looking for a letter about
+  the roof"). It runs immediately and the results appear in the chat, each one clickable to
+  reveal where that file sits in the subject map.
+
+  It searches FOUR things at once: filenames, the text inside documents, and each file's
+  stored description -- both by wording and by MEANING. Every file has a description of what
+  it is, including photos, videos and audio recordings, which have no text at all. So this
+  action works for "the video of the kids at the beach" and "the picture of a handwritten
+  recipe", not only for text documents. Pass the user's description in full; meaning-matching
+  is what makes it work, and reducing it to two keywords throws that away.
+
+  Prefer this over telling the user you cannot find something: search first, then report. If
+  the results look wrong, say so and suggest better terms rather than inventing a match. When
+  a result matched on its description rather than its contents, the card says so -- if the
+  user seems to be after something else, that is the thing to point out.
 - reject_proposals: discard every PENDING rename proposal at or BELOW a confidence score.
   Needs maxConfidence (0 to 1). This is the cleanup counterpart to approve_proposals, for
   "get rid of the 0% ones", "clear the junk suggestions", "reject anything under 20%".

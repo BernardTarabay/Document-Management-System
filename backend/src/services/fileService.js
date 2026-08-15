@@ -11,6 +11,7 @@ const subjectRepository = require("../repositories/subjectRepository");
 const documentTypeRepository = require("../repositories/documentTypeRepository");
 const auditLogRepository = require("../repositories/auditLogRepository");
 const { getStorageServiceFor } = require("./storage/storageService");
+const descriptionSearchService = require("./descriptionSearchService");
 const { parseFileFilters } = require("../repositories/fileFilters");
 const { renameToAvailableName } = require("../utils/resolveAvailableFilename");
 const { assertSafeFilename } = require("../utils/filenameSafety");
@@ -52,10 +53,27 @@ async function search(query, ownerUserId) {
   // it exists to do -- nobody remembers what a badly-named file was called,
   // they remember what was in it. `mode=filename` keeps the old behaviour
   // for callers that specifically want a name lookup.
+  //
+  // The default now also matches what each file IS -- its description -- both
+  // by wording and by MEANING, so typing what you remember about a document
+  // finds it even when you share no words with it (see
+  // descriptionSearchService). `mode=content` pins the previous behaviour for
+  // anyone who wants the old ranking exactly.
   if (query.q) {
-    return query.mode === "filename"
-      ? fileRepository.searchByFilename(query.q, ownerUserId, { limit, offset })
-      : fileRepository.searchEverything(query.q, { limit, offset, filters });
+    if (query.mode === "filename") {
+      return fileRepository.searchByFilename(query.q, ownerUserId, { limit, offset });
+    }
+    if (query.mode === "content") {
+      return fileRepository.searchEverything(query.q, { limit, offset, filters });
+    }
+    const result = await descriptionSearchService.search(query.q, { filters, limit, offset });
+    // Still a bare array: four callers already consume this shape (the Files
+    // page, the Subjects page, the compare picker, the assistant's page
+    // context), and changing it to attach one flag would break all of them.
+    // How each row matched rides along ON the row instead, and whether the
+    // semantic half ran at all is reported by the controller as a header.
+    result.files.searchMode = result.semanticUsed ? "hybrid" : "lexical";
+    return result.files;
   }
   if (query.status) return fileRepository.listByStatus(query.status, ownerUserId, { limit, offset });
   // Default view -- excludes 'deleted' so removed files (single or bulk)

@@ -326,6 +326,35 @@ async function updateAiEnrichment(id, { shortTitle, summary, entities }) {
 }
 
 /**
+ * Mirror a description into the denormalised columns WITHOUT claiming the
+ * classifier ran.
+ *
+ * `ai_classified_at` is not a "last touched" timestamp -- it is the record
+ * that the AI classification or vision tier produced this enrichment, and
+ * classifyProcessor and descriptionService both branch on it to decide whether
+ * an existing summary can be adopted instead of paid for again.
+ *
+ * The describe stage writes ai_summary for surfaces that already read it
+ * (the Files page, the detail modal, the preview pane), and for a file nothing
+ * could read that summary is assembled from facts with no model involved.
+ * Stamping ai_classified_at alongside it would make that facts-only sentence
+ * indistinguishable from a classifier result -- so the next time the file
+ * acquired real text, the pipeline would adopt "PDF document, 240 KB, stored
+ * in Scans" as its considered description of the contents and never look
+ * again. Leaving the timestamp alone keeps it meaning exactly one thing.
+ */
+async function mirrorDescription(id, { shortTitle, summary }) {
+  const { rows } = await db.query(
+    `UPDATE files
+        SET ai_short_title = COALESCE($2, ai_short_title),
+            ai_summary = $3
+      WHERE id = $1 RETURNING *`,
+    [id, shortTitle, summary]
+  );
+  return rows[0] || null;
+}
+
+/**
  * An already-processed file with byte-for-byte identical content.
  *
  * WHY: registering a second folder that overlaps an existing one used to put
@@ -1073,6 +1102,7 @@ module.exports = {
   listBySubject,
   countBySubject,
   updateAiEnrichment,
+  mirrorDescription,
   findClassifiedSiblingByHash,
   findProcessedTwinByHash,
 };

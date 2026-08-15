@@ -33,17 +33,38 @@ export function SearchSnippet({ snippet, className = "" }) {
 }
 
 /**
- * Why a result matched -- content, name, or the AI title/summary. Worth
- * showing: "this matched inside the document" and "this matched its
- * filename" are very different levels of confidence for the person reading.
+ * Why a result matched. Worth showing: "this matched inside the document" and
+ * "this matched its filename" are very different levels of confidence for the
+ * person reading.
+ *
+ * "by meaning" is the one that most needs saying. A file can now come back
+ * without sharing a single word with what was typed -- "kid blowing out
+ * candles" reaching a description that reads "a child at a party with a cake"
+ * -- and a result with no visible connection to the query reads as a bug
+ * unless the search admits what it did.
  */
 export function MatchReason({ file }) {
+  // The hybrid search reports which signals fired, per row. The older
+  // boolean columns are still populated by the content search underneath it,
+  // so both shapes are handled rather than one replacing the other.
+  const semantic = file.matched_by?.includes("semantic");
   const reasons = [
+    semantic && "by meaning",
+    file.matched_by?.includes("description") && "in its description",
     file.matched_content && "in content",
     file.matched_filename && "in name",
     file.matched_ai && "in AI title",
   ].filter(Boolean);
 
   if (reasons.length === 0) return null;
-  return <span className="text-[11px] text-base-500">matched {reasons.join(" · ")}</span>;
+  return (
+    <span className="text-[11px] text-base-500">
+      matched {reasons.join(" · ")}
+      {semantic && typeof file.similarity === "number" && (
+        <span className="ml-1 text-base-600" title="How closely the description matches what you described, 0 to 1.">
+          ({file.similarity.toFixed(2)})
+        </span>
+      )}
+    </span>
+  );
 }

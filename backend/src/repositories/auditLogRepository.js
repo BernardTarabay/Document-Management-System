@@ -57,6 +57,27 @@ async function countSince(action, since) {
   return rows[0].count;
 }
 
+/**
+ * The same count across SEVERAL actions at once.
+ *
+ * AI_DAILY_CALL_CAP is a budget for one API key, but each caller was checking
+ * it against only its own audit action -- so the classifier could spend the
+ * full cap, the image describer could spend it again, and each would correctly
+ * report that it had stayed inside the limit. Three tiers each respecting a
+ * 500-call cap is a 1,500-call day.
+ *
+ * Callers that share a budget pass the whole family of actions here and get
+ * the number that the cap actually applies to.
+ */
+async function countSinceAny(actions, since) {
+  const list = (Array.isArray(actions) ? actions : [actions]).filter(Boolean);
+  if (!list.length) return 0;
+  const { rows } = await db.query(
+    "SELECT COUNT(*)::int AS count FROM audit_logs WHERE action = ANY($1::text[]) AND created_at >= $2",
+    [list, since]
+  );
+  return rows[0].count;
+}
 
 /**
  * Deliberate, single exception to "audit rows are write-once" (see the
@@ -80,4 +101,4 @@ async function listForExport({ limit = 10000 } = {}) {
   return rows;
 }
 
-module.exports = { record, listForEntity, listRecent, countSince, clearAll, listForExport };
+module.exports = { record, listForEntity, listRecent, countSince, countSinceAny, clearAll, listForExport };

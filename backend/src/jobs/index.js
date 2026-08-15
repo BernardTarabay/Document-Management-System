@@ -19,6 +19,7 @@ const detectVersionsProcessor = require("./processors/detectVersionsProcessor");
 const reindexProcessor = require("./processors/reindexProcessor");
 const syncMirrorProcessor = require("./processors/syncMirrorProcessor");
 const ocrProcessor = require("./processors/ocrProcessor");
+const describeProcessor = require("./processors/describeProcessor");
 
 // `bulk_move` and `replicate` are the job_types with no processor here.
 //
@@ -41,6 +42,7 @@ const PROCESSORS = {
   [JobType.REINDEX]: reindexProcessor,
   [JobType.SYNC_MIRROR]: syncMirrorProcessor,
   [JobType.OCR]: ocrProcessor,
+  [JobType.DESCRIBE]: describeProcessor,
   [JobType.GENERATE_NAMES]: generateNamesProcessor,
   [JobType.BULK_RENAME]: bulkRenameProcessor,
   [JobType.BULK_DELETE]: bulkDeleteProcessor,

@@ -80,6 +80,9 @@ const JobType = Object.freeze({
   // migration 031. OCR is implemented (jobs/processors/ocrProcessor.js);
   // REPLICATE is declared but has no processor -- see jobs/index.js.
   OCR: "ocr", REPLICATE: "replicate",
+  // migration 034. One plain-language description per file, and the embedding
+  // that makes it findable by describing it -- services/descriptionService.js.
+  DESCRIBE: "describe",
 });
 
 const JobStatus = Object.freeze({
