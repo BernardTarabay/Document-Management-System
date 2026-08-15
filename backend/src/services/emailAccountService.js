@@ -5,7 +5,6 @@
 const emailAccountRepository = require("../repositories/emailAccountRepository");
 const auditLogRepository = require("../repositories/auditLogRepository");
 const googleOAuthClient = require("./email/googleOAuthClient");
-const microsoftOAuthClient = require("./email/microsoftOAuthClient");
 const tokenCrypto = require("../utils/tokenCrypto");
 const { signOAuthState, verifyOAuthState } = require("../utils/jwt");
 const { enqueueJob } = require("../queues");
@@ -30,7 +29,6 @@ class ForbiddenError extends Error {
 
 function clientFor(provider) {
   if (provider === EmailProvider.GMAIL) return googleOAuthClient;
-  if (provider === EmailProvider.OUTLOOK) return microsoftOAuthClient;
   throw new ValidationError(`Unknown email provider "${provider}".`);
 }
 
@@ -80,7 +78,7 @@ async function handleCallback(provider, code, state) {
   const tokens = await client.exchangeCodeForTokens(code);
   if (!tokens.refresh_token) {
     throw new ValidationError(
-      "Google/Microsoft didn't return a refresh token for this connection. This usually means the account " +
+      "Google didn't return a refresh token for this connection. This usually means the account " +
       "was already connected once before without fully disconnecting first -- try disconnecting (if listed) " +
       "and reconnecting."
     );
@@ -146,7 +144,7 @@ async function disconnect(id, userId) {
   const account = await getOwned(id, userId);
 
   // Best-effort token revocation -- Google exposes a simple universal
-  // revoke endpoint; Microsoft's v2 endpoint has no equivalent single call
+  // revoke endpoint.
   // for a refresh token, so there's nothing extra to do there beyond
   // clearing our own copy below. Either way, a failed revoke call never
   // blocks disconnecting locally -- the user asked to disconnect, and the

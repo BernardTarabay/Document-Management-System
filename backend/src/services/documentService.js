@@ -1,6 +1,7 @@
 const documentRepository = require("../repositories/documentRepository");
 const auditLogRepository = require("../repositories/auditLogRepository");
 const { parsePagination } = require("../utils/pagination");
+const { requireOwner } = require("../repositories/ownership");
 const { ValidationError } = require("../validators/validationError");
 
 class NotFoundError extends Error {
@@ -11,15 +12,16 @@ class NotFoundError extends Error {
   }
 }
 
-async function search(query) {
+async function search(query, ownerUserId) {
+  requireOwner(ownerUserId, "documentService.search");
   const { limit, offset } = parsePagination(query);
-  if (query.q) return documentRepository.searchByName(query.q, { limit, offset });
-  if (query.subjectId) return documentRepository.listBySubject(query.subjectId, { limit, offset });
-  return documentRepository.list({ limit, offset });
+  if (query.q) return documentRepository.searchByName(query.q, ownerUserId, { limit, offset });
+  if (query.subjectId) return documentRepository.listBySubject(query.subjectId, ownerUserId, { limit, offset });
+  return documentRepository.listForOwner(ownerUserId, { limit, offset });
 }
 
-async function getById(id) {
-  const document = await documentRepository.getFullById(id);
+async function getById(id, ownerUserId) {
+  const document = await documentRepository.getFullById(id, ownerUserId);
   if (!document) throw new NotFoundError("Document not found.");
   return document;
 }
@@ -30,7 +32,7 @@ async function getById(id) {
  * through version-detection/confirmation flows, never a raw PATCH.
  */
 async function update(id, { displayName, documentTypeId }, actorUserId) {
-  const existing = await documentRepository.findById(id);
+  const existing = await documentRepository.findByIdForOwner(id, actorUserId);
   if (!existing) throw new NotFoundError("Document not found.");
   if (!displayName && !documentTypeId) {
     throw new ValidationError("At least one of displayName or documentTypeId is required.");

@@ -18,6 +18,14 @@
 // a recent interval and says so on screen.
 
 const db = require("../config/database");
+const { requireOwner } = require("./ownership");
+
+// A row that belongs to the caller by way of the file it describes. Used by
+// the subqueries over rename_proposals and file_content, neither of which
+// carries an owner column -- ownership of a proposal is not an independent
+// fact, it is a consequence of which file the proposal is about.
+const OWNED_FILE = (fileIdExpr) =>
+  `EXISTS (SELECT 1 FROM files of WHERE of.id = ${fileIdExpr} AND of.owner_user_id = $1)`;
 
 // A file counts as "in the repository" unless it has been deleted. Missing
 // files (the drive is unplugged) still count -- they are known documents, and
@@ -33,7 +41,8 @@ const LIVE = "f.status <> 'deleted'";
  * with the worker and report a funnel where a later stage exceeds an earlier
  * one.
  */
-async function overview() {
+async function overview(ownerUserId) {
+  requireOwner(ownerUserId, "dashboard.overview");
   const { rows } = await db.query(
     `SELECT
        count(*)::int                                                        AS total_files,
@@ -54,7 +63,8 @@ async function overview() {
        WHERE cr.file_id = f.id AND cr.classified_subject_id IS NOT NULL
        ORDER BY cr.created_at DESC LIMIT 1
      ) cls ON true
-     WHERE ${LIVE}`
+     WHERE ${LIVE} AND f.owner_user_id = $1`,
+    [ownerUserId]
   );
   return rows[0];
 }
@@ -66,19 +76,26 @@ async function overview() {
  * job is to say "there are 3,412 suggestions worth clearing", and the page
  * that can actually clear them is one click away.
  */
-async function attention() {
+async function attention(ownerUserId) {
+  requireOwner(ownerUserId, "dashboard.attention");
+  // Every subquery carries the owner. rename_proposals and file_content have
+  // no owner column of their own, so they reach it through the file they
+  // describe -- the same EXISTS shape renameProposalRepository uses.
   const { rows } = await db.query(
     `SELECT
-       (SELECT count(*)::int FROM rename_proposals WHERE status = 'pending')                    AS pending_proposals,
-       (SELECT count(*)::int FROM rename_proposals WHERE status = 'pending' AND confidence_score <= 0)
-                                                                                                AS zero_confidence_proposals,
-       (SELECT count(*)::int FROM duplicate_groups WHERE status = 'open' AND group_type = 'exact')
-                                                                                                AS open_exact_duplicates,
-       (SELECT count(*)::int FROM duplicate_groups WHERE status = 'open' AND group_type = 'probable')
-                                                                                                AS open_probable_duplicates,
-       (SELECT count(*)::int FROM file_content WHERE needs_ocr)                                 AS needs_ocr,
+       (SELECT count(*)::int FROM rename_proposals rp
+         WHERE rp.status = 'pending' AND ${OWNED_FILE("rp.file_id")})                            AS pending_proposals,
+       (SELECT count(*)::int FROM rename_proposals rp
+         WHERE rp.status = 'pending' AND rp.confidence_score <= 0
+           AND ${OWNED_FILE("rp.file_id")})                                                     AS zero_confidence_proposals,
+       (SELECT count(*)::int FROM duplicate_groups
+         WHERE status = 'open' AND group_type = 'exact' AND owner_user_id = $1)                 AS open_exact_duplicates,
+       (SELECT count(*)::int FROM duplicate_groups
+         WHERE status = 'open' AND group_type = 'probable' AND owner_user_id = $1)              AS open_probable_duplicates,
+       (SELECT count(*)::int FROM file_content fc
+         WHERE fc.needs_ocr AND ${OWNED_FILE("fc.file_id")})                                    AS needs_ocr,
        (SELECT count(*)::int FROM files f
-          WHERE ${LIVE} AND f.status = 'active'
+          WHERE ${LIVE} AND f.status = 'active' AND f.owner_user_id = $1
             AND NOT EXISTS (SELECT 1 FROM classification_results cr
                              WHERE cr.file_id = f.id AND cr.classified_subject_id IS NOT NULL)) AS unfiled,
        -- Discovered but going nowhere: no hash or no content row, and no job
@@ -86,15 +103,18 @@ async function attention() {
        -- non-zero number here means "the next scan has work to do", not
        -- "these are lost".
        (SELECT count(*)::int FROM files f
-          WHERE f.status = 'active'
+          WHERE f.status = 'active' AND f.owner_user_id = $1
             AND (f.sha256_hash IS NULL
                  OR NOT EXISTS (SELECT 1 FROM file_content fc WHERE fc.file_id = f.id))
             AND NOT EXISTS (SELECT 1 FROM processing_jobs pj
                              WHERE pj.status IN ('queued','running')
                                AND pj.payload->>'fileId' = f.id::text))                         AS stalled,
-       (SELECT count(*)::int FROM processing_jobs WHERE status IN ('queued','running'))         AS jobs_in_flight,
        (SELECT count(*)::int FROM processing_jobs
-         WHERE status = 'failed' AND finished_at > now() - interval '24 hours')                 AS jobs_failed_today`
+         WHERE status IN ('queued','running') AND owner_user_id = $1)                           AS jobs_in_flight,
+       (SELECT count(*)::int FROM processing_jobs
+         WHERE status = 'failed' AND owner_user_id = $1
+           AND finished_at > now() - interval '24 hours')                                       AS jobs_failed_today`,
+    [ownerUserId]
   );
   return rows[0];
 }
@@ -108,7 +128,8 @@ async function attention() {
  * count -- probable ones are unconfirmed guesses and it would be dishonest
  * to put their bytes in a "reclaimable" figure.
  */
-async function reclaimableBytes() {
+async function reclaimableBytes(ownerUserId) {
+  requireOwner(ownerUserId, "dashboard.reclaimableBytes");
   const { rows } = await db.query(
     `SELECT coalesce(sum(f.size_bytes), 0)::bigint AS bytes,
             count(*)::int                          AS copies
@@ -116,6 +137,7 @@ async function reclaimableBytes() {
        JOIN duplicate_groups dg ON dg.id = dgm.duplicate_group_id
        JOIN files f ON f.id = dgm.file_id
       WHERE dg.group_type = 'exact'
+        AND dg.owner_user_id = $1
         AND f.status <> 'deleted'
         -- Every member EXCEPT the one kept. When a group has no canonical
         -- pick yet, all but one copy is still redundant, so charge the group
@@ -125,7 +147,8 @@ async function reclaimableBytes() {
               (SELECT f2.id FROM duplicate_group_members m2
                  JOIN files f2 ON f2.id = m2.file_id
                 WHERE m2.duplicate_group_id = dg.id
-                ORDER BY f2.imported_at ASC LIMIT 1))`
+                ORDER BY f2.imported_at ASC LIMIT 1))`,
+    [ownerUserId]
   );
   return rows[0];
 }
@@ -138,7 +161,8 @@ async function reclaimableBytes() {
  * readable" is the OCR argument, and it is the difference between a search
  * box that finds things and one that quietly does not.
  */
-async function byExtension(limit = 10) {
+async function byExtension(ownerUserId, limit = 10) {
+  requireOwner(ownerUserId, "dashboard.byExtension");
   const { rows } = await db.query(
     `SELECT lower(coalesce(nullif(f.extension, ''), '(none)')) AS ext,
             count(*)::int                                       AS files,
@@ -146,17 +170,18 @@ async function byExtension(limit = 10) {
             count(*) FILTER (WHERE fc.text_quality = 'ok')::int  AS searchable
        FROM files f
        LEFT JOIN file_content fc ON fc.file_id = f.id
-      WHERE ${LIVE}
+      WHERE ${LIVE} AND f.owner_user_id = $1
       GROUP BY 1
       ORDER BY files DESC
-      LIMIT $1`,
-    [limit]
+      LIMIT $2`,
+    [ownerUserId, limit]
   );
   return rows;
 }
 
 /** Per-location totals, so "which folder is all of this coming from" is answerable. */
-async function byLocation() {
+async function byLocation(ownerUserId) {
+  requireOwner(ownerUserId, "dashboard.byLocation");
   const { rows } = await db.query(
     `SELECT s.id, s.name, s.root_path, s.is_read_only,
             count(f.id)::int                                     AS files,
@@ -166,42 +191,48 @@ async function byLocation() {
        FROM storage_locations s
        LEFT JOIN files f ON f.storage_location_id = s.id AND f.status <> 'deleted'
        LEFT JOIN filesystem_scans fs ON fs.storage_location_id = s.id AND fs.status = 'completed'
+      WHERE s.owner_user_id = $1 AND s.is_active = true
       GROUP BY s.id, s.name, s.root_path, s.is_read_only
-      ORDER BY files DESC`
+      ORDER BY files DESC`,
+    [ownerUserId]
   );
   return rows;
 }
 
 /** What the pipeline has been doing lately, by job type. */
-async function recentJobs(hours = 24) {
+async function recentJobs(ownerUserId, hours = 24) {
+  requireOwner(ownerUserId, "dashboard.recentJobs");
   const { rows } = await db.query(
     `SELECT job_type,
             count(*) FILTER (WHERE status = 'completed')::int AS completed,
             count(*) FILTER (WHERE status = 'failed')::int    AS failed,
             count(*) FILTER (WHERE status IN ('queued','running'))::int AS active
        FROM processing_jobs
-      WHERE created_at > now() - make_interval(hours => $1)
+      WHERE owner_user_id = $1
+        AND created_at > now() - make_interval(hours => $2)
       GROUP BY job_type
       HAVING count(*) > 0
       ORDER BY 2 DESC, 1`,
-    [hours]
+    [ownerUserId, hours]
   );
   return rows;
 }
 
 /** Files added per day, for the "is this thing still ingesting" question. */
-async function ingestionTrend(days = 14) {
+async function ingestionTrend(ownerUserId, days = 14) {
+  requireOwner(ownerUserId, "dashboard.ingestionTrend");
   const { rows } = await db.query(
     `SELECT d::date AS day, coalesce(c.n, 0)::int AS files
        FROM generate_series(now()::date - ($1::int - 1), now()::date, interval '1 day') d
        LEFT JOIN (
          SELECT imported_at::date AS day, count(*) AS n
            FROM files
-          WHERE status <> 'deleted' AND imported_at > now() - make_interval(days => $1)
+          WHERE status <> 'deleted' AND owner_user_id = $2
+            AND imported_at > now() - make_interval(days => $1)
           GROUP BY 1
        ) c ON c.day = d::date
       ORDER BY day`,
-    [days]
+    [days, ownerUserId]
   );
   return rows;
 }

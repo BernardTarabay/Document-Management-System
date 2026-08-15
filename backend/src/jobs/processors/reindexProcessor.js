@@ -50,7 +50,7 @@ const DEFAULT_STAGES = ["extractMetadata", "extractText"];
  *                                                 which re-chains classification and naming itself
  * @param {string}   [payload.actorUserId]
  */
-async function handle({ storageLocationId = null, fileIds = null, stages = null, actorUserId = null }, bullJob) {
+async function handle({ storageLocationId = null, fileIds = null, stages = null, actorUserId = null, ownerUserId = null }, bullJob) {
   const requestedStages = (stages && stages.length ? stages : DEFAULT_STAGES).filter((s) => STAGE_JOBS[s]);
   if (requestedStages.length === 0) {
     throw new Error(
@@ -61,7 +61,14 @@ async function handle({ storageLocationId = null, fileIds = null, stages = null,
   const processingJobId = bullJob?.data?.processingJobId || null;
   const summary = { filesProcessed: 0, jobsEnqueued: 0, failed: 0, stages: requestedStages };
 
-  const targets = await resolveTargets({ storageLocationId, fileIds });
+  // Every reindex acts on exactly one account's files. Resolved once, here,
+  // and passed down rather than re-derived per file: a reindex that silently
+  // widened its scope mid-run would re-enqueue the whole pipeline for
+  // documents its requester cannot see.
+  const owner = ownerUserId || actorUserId;
+  if (!owner) throw new Error("reindex requires the owner whose files are being reprocessed.");
+
+  const targets = await resolveTargets({ storageLocationId, fileIds, ownerUserId: owner });
   if (processingJobId) {
     // The total is only knowable here, after resolving which files this run
     // covers -- enqueueJob's progressTotal is set too early for that.
@@ -86,6 +93,7 @@ async function handle({ storageLocationId = null, fileIds = null, stages = null,
           await enqueueJob(jobType, payload, {
             storageLocationId: file.storage_location_id,
             createdBy: actorUserId,
+            ownerUserId: owner,
           });
           summary.jobsEnqueued += 1;
         }
@@ -121,14 +129,12 @@ async function handle({ storageLocationId = null, fileIds = null, stages = null,
   return summary;
 }
 
-async function resolveTargets({ storageLocationId, fileIds }) {
+async function resolveTargets({ storageLocationId, fileIds, ownerUserId }) {
   if (fileIds && fileIds.length) {
-    const found = [];
-    for (const id of fileIds) {
-      const file = await fileRepository.findById(id);
-      if (file && file.status === "active") found.push(file);
-    }
-    return found;
+    // Owner-scoped lookup, so an id list carrying somebody else's file simply
+    // yields nothing for it rather than reprocessing it.
+    return (await fileRepository.listByIdsForOwner(fileIds, ownerUserId))
+      .filter((f) => f.status === "active");
   }
 
   // Paginate rather than SELECT *: a reindex over a large repository must
@@ -136,7 +142,7 @@ async function resolveTargets({ storageLocationId, fileIds }) {
   const all = [];
   const pageSize = 500;
   for (let offset = 0; ; offset += pageSize) {
-    const page = await fileRepository.listByStatus("active", { limit: pageSize, offset });
+    const page = await fileRepository.listByStatus("active", ownerUserId, { limit: pageSize, offset });
     const filtered = storageLocationId
       ? page.filter((f) => f.storage_location_id === storageLocationId)
       : page;

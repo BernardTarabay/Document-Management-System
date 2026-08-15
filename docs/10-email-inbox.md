@@ -1,32 +1,40 @@
 # Email inbox triage (post-Phase-11 addition)
 
+> **Outlook / Microsoft 365 support has been removed.** Gmail is the only email
+> provider. `microsoftOAuthClient.js` and `outlookApiClient.js` are deleted, the
+> `MICROSOFT_OAUTH_*` environment variables are gone, and `EmailProvider` in
+> `models/enums.js` now contains only `gmail` — so an Outlook account can no longer be
+> connected, refreshed or synced. The Postgres `email_provider` enum still carries the
+> `'outlook'` value, because Postgres cannot drop a value from an enum in place and any
+> historical row must remain readable; nothing accepts it as input. An account row left
+> over from before the removal renders on the Inbox page (so it can be disconnected) and
+> its sync fails loudly rather than silently returning an empty mailbox.
+
 A separate "Inbox" page, distinct from the document taxonomy. The user connects a Gmail
-and/or Outlook account; the app periodically pulls new inbox mail, auto-deletes what looks
-like advertising/spam/newsletter clutter, and leaves everything else visible on the Inbox
-page as a curated, read-only view. Opening a message never renders the email body in this
-app — it opens the real message in the provider's own web inbox (Gmail/Outlook) in a new
-tab. Nothing about this feature reads or writes the taxonomy, files, or documents; it's
-additive and independent of Phases 1–11.
+account; the app periodically pulls new inbox mail, auto-deletes what looks like
+advertising/spam/newsletter clutter, and leaves everything else visible on the Inbox page
+as a curated, read-only view. Opening a message never renders the email body in this
+app — it opens the real message in Gmail's own web inbox in a new tab. Nothing about this
+feature reads or writes the taxonomy, files, or documents; it's additive and independent
+of Phases 1–11.
 
 ## Why OAuth2, not IMAP/password
 
-Both Gmail and Outlook have retired plain password auth for third-party mail access.
-`googleOAuthClient.js` and `microsoftOAuthClient.js` implement the standard
-authorization-code flow with raw `fetch()` calls (no `googleapis` or `@azure/msal-node`
-SDK — same style as the Gemini client already in this codebase). Requested scopes:
+Gmail has retired plain password auth for third-party mail access. `googleOAuthClient.js`
+implements the standard authorization-code flow with raw `fetch()` calls (no `googleapis`
+SDK — same style as the Gemini client already in this codebase). Requested scope:
 
 - **Gmail**: `https://www.googleapis.com/auth/gmail.modify` (read + move-to-trash;
   never `gmail.readonly`-only, since triage needs to trash messages, and never the
   broader `mail.google.com` scope, which also allows permanent delete/send)
-- **Outlook**: `offline_access Mail.ReadWrite User.Read` via Microsoft Graph
 
 `access_type=offline&prompt=consent` is forced on the Google auth URL so a refresh token
 is issued on every consent, not just the first one — without `prompt=consent`, a user who
 revokes and reconnects wouldn't get a new refresh token back from Google on the second
-grant. Microsoft commonly **rotates** the refresh token on every use; both
+grant. Google generally does not return a refresh token on a plain refresh call, but both
 `emailAccountService` (manual actions) and `emailSyncProcessor` (every sync) check the
-token response for a new `refresh_token` and re-persist it when present, regardless of
-provider.
+token response for a new `refresh_token` and re-persist it when present, so a rotated
+token is never lost.
 
 Refresh tokens are the only long-lived secret stored. They're encrypted at rest with
 AES-256-GCM (`utils/tokenCrypto.js`; key derived via SHA-256 of `TOKEN_ENCRYPTION_KEY` —
@@ -102,7 +110,7 @@ The user chose fully automatic triage: no review queue, no "are you sure" step b
 leans on rails elsewhere instead of a human gate:
 
 - **Reversible by construction.** Neither provider call is a permanent delete —
-  Gmail's `trashMessage` moves to Trash (`messages/{id}/trash`), Outlook's
+  Gmail's `trashMessage` moves to Trash (`messages/{id}/trash`); the former Outlook path,
   `moveToDeletedItems` moves to the Deleted Items folder (`messages/{id}/move`). Both
   providers keep trashed mail recoverable for a retention window before permanent
   deletion, same as clicking the provider's own trash button.
@@ -133,9 +141,9 @@ this app.
 ## Setup
 
 All required environment variables (`TOKEN_ENCRYPTION_KEY`, `FRONTEND_URL`,
-`GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI`, `MICROSOFT_OAUTH_CLIENT_ID/SECRET/TENANT_ID/
-REDIRECT_URI`, `EMAIL_SYNC_INTERVAL_MINUTES`) and the Google Cloud Console / Azure Portal
-setup steps to obtain them are documented inline in `backend/.env.example`. In short:
+`GOOGLE_OAUTH_CLIENT_ID/SECRET/REDIRECT_URI`, `EMAIL_SYNC_INTERVAL_MINUTES`) and the
+Google Cloud Console setup steps to obtain them are documented inline in
+`backend/.env.example`. In short:
 
 1. Generate `TOKEN_ENCRYPTION_KEY` with `openssl rand -hex 32`.
 2. Google Cloud Console: enable the Gmail API, create an OAuth client (Web application),
@@ -153,7 +161,7 @@ setup steps to obtain them are documented inline in `backend/.env.example`. In s
 
 ## What's deliberately not here yet
 
-No IMAP/other-provider support (Yahoo, iCloud, self-hosted mail) — Gmail and Outlook cover
+No IMAP/other-provider support (Yahoo, iCloud, Outlook, self-hosted mail) — Gmail covers
 the two providers the user actually asked for. No per-message manual "restore"/"mark
 important after the fact" action from the Inbox page — undoing a triage decision today
 means going into the provider's own web inbox directly (which the "Open" link on every row

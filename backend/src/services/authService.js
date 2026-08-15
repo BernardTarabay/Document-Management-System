@@ -5,6 +5,9 @@ const userRepository = require("../repositories/userRepository");
 const roleRepository = require("../repositories/roleRepository");
 const refreshTokenRepository = require("../repositories/refreshTokenRepository");
 const auditLogRepository = require("../repositories/auditLogRepository");
+const subjectRepository = require("../repositories/subjectRepository");
+const deviceRepository = require("../repositories/deviceRepository");
+const subjectService = require("./subjectService");
 const { hashPassword, verifyPassword } = require("../utils/passwords");
 const {
   signAccessToken,
@@ -54,6 +57,24 @@ async function register({ email, password, fullName }, context = {}) {
 
   const defaultRole = await roleRepository.findByName("User");
   if (defaultRole) await userRepository.assignRole(user.id, defaultRole.id, null);
+
+  // A new account starts with nothing at all now that subjects are per-user:
+  // no folders to file into, and no device row for the server its storage
+  // locations will live on. Both are created here rather than lazily, so the
+  // very first visit shows a usable Subjects page instead of an empty tree
+  // with a "create your first folder" dead end.
+  //
+  // Neither is allowed to fail the registration. Someone who has an account
+  // but no starter folders can make their own; someone whose account creation
+  // rolled back because a seed folder collided has no account at all, which
+  // is strictly worse. The failure is logged, and both are idempotent enough
+  // to be re-run.
+  try {
+    await subjectRepository.seedStarterTree(user.id, subjectService.slugify);
+    await deviceRepository.ensureServerDevice(user.id);
+  } catch (err) {
+    console.error(`[auth] Could not seed starter data for ${user.id}:`, err.message);
+  }
 
   await auditLogRepository.record({
     userId: user.id,

@@ -2,6 +2,7 @@ const env = require("./config/env");
 const app = require("./app");
 const { pool } = require("./config/database");
 const { startEmailSyncScheduler, stopEmailSyncScheduler } = require("./jobs/emailSyncScheduler");
+const filesystemBrowseService = require("./services/filesystemBrowseService");
 const { storageWatcher } = require("./jobs/storageWatcher");
 
 const server = app.listen(env.port, () => {
@@ -13,6 +14,11 @@ const server = app.listen(env.port, () => {
   // jobs, and running it in every worker replica would queue the same scan
   // once per replica.
   storageWatcher.start().catch((err) => console.error("[watcher] Failed to start:", err.message));
+
+  // The folder picker is unconfined by default, which is right for the
+  // self-hosted desktop this app is built for and wrong the moment a second
+  // account exists. Checked at boot rather than assumed either way.
+  filesystemBrowseService.warnIfSharedAndUnconfined().catch(() => {});
 });
 
 // Graceful shutdown so in-flight DB queries / connections close cleanly.

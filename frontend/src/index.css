@@ -161,6 +161,22 @@ body {
     background: linear-gradient(135deg, rgba(124, 92, 255, 0.22), rgba(124, 92, 255, 0.06));
     box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.3);
   }
+
+  /* Horizontal navigation (components/TopNav.jsx).
+     Tighter than .nav-link because these sit in a 56px bar rather than a
+     column, and `whitespace-nowrap` because a label that wraps mid-word turns
+     the whole bar two rows tall at one awkward width. */
+  .topnav-link {
+    @apply flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-sm
+           font-medium text-base-300 transition-colors duration-150
+           hover:bg-white/[0.05] hover:text-base-100;
+  }
+  .topnav-link-active {
+    @apply flex shrink-0 items-center gap-2 whitespace-nowrap rounded-lg px-2.5 py-1.5 text-sm
+           font-medium text-white transition-colors duration-150;
+    background: linear-gradient(135deg, rgba(124, 92, 255, 0.24), rgba(124, 92, 255, 0.07));
+    box-shadow: inset 0 0 0 1px rgba(124, 92, 255, 0.32);
+  }
 }
 
 @keyframes fade-in-up {

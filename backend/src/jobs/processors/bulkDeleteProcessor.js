@@ -13,7 +13,12 @@ const { FileStatus } = require("../../models/enums");
 
 const BATCH_SIZE = 200;
 
-async function handle({ actorUserId }, bullJob) {
+async function handle({ actorUserId, ownerUserId }, bullJob) {
+  // Whose files this deletes. Taken from the job payload rather than
+  // re-derived, and never defaulted: an unscoped "remove all active files"
+  // would enumerate every account's corpus from one person's button press.
+  ownerUserId = ownerUserId || actorUserId;
+  if (!ownerUserId) throw new Error("bulk_delete requires the owner whose files are being removed.");
   const summary = { removed: 0, failed: 0 };
   let processed = 0;
 
@@ -30,11 +35,11 @@ async function handle({ actorUserId }, bullJob) {
   // recomputed from a fresh count rather than a fixed constant like 10000 --
   // a fixed cap either wastes cycles for small libraries or silently cuts
   // off huge ones.
-  const startingActive = await fileRepository.countByStatus(FileStatus.ACTIVE);
+  const startingActive = await fileRepository.countByStatus(FileStatus.ACTIVE, ownerUserId);
   const maxBatches = Math.max(1, Math.ceil(startingActive / BATCH_SIZE)) + 5; // +5 slack for files added mid-run
 
   for (let batchCount = 0; batchCount < maxBatches; batchCount += 1) {
-    const batch = await fileRepository.listByStatus(FileStatus.ACTIVE, {
+    const batch = await fileRepository.listByStatus(FileStatus.ACTIVE, ownerUserId, {
       limit: BATCH_SIZE,
       offset: 0,
       excludeIds: failedIds,

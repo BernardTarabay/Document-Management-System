@@ -1,4 +1,4 @@
-// Connected mailboxes (docs/10-email-inbox.md). One row per Gmail/Outlook
+// Connected mailboxes (docs/10-email-inbox.md). One row per Gmail
 // account a user has connected for inbox triage.
 const db = require("../config/database");
 const { createBaseRepository } = require("./baseRepository");

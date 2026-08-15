@@ -8,10 +8,17 @@ const mirrorService = require("../../services/mirror/mirrorService");
 const processingJobRepository = require("../../repositories/processingJobRepository");
 const auditLogRepository = require("../../repositories/auditLogRepository");
 
-async function handle({ prune = true, actorUserId = null } = {}, bullJob) {
+async function handle({ prune = true, actorUserId = null, ownerUserId = null } = {}, bullJob) {
   const processingJobId = bullJob?.data?.processingJobId || null;
 
+  // The mirror is one account's organized view of one account's files, so it
+  // is built per owner. A sync with no owner would previously have walked
+  // every file in the database into a single shortcut tree.
+  const owner = ownerUserId || actorUserId;
+  if (!owner) throw new Error("sync_mirror requires the owner whose mirror is being rebuilt.");
+
   const summary = await mirrorService.sync({
+    ownerUserId: owner,
     prune,
     onProgress: ({ processed, total }) => {
       if (!processingJobId) return;

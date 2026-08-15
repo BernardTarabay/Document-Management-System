@@ -23,6 +23,8 @@ const duplicateGroupRoutes = require("./routes/duplicateGroupRoutes");
 const renameProposalRoutes = require("./routes/renameProposalRoutes");
 const processingJobRoutes = require("./routes/processingJobRoutes");
 const triageRoutes = require("./routes/triageRoutes");
+const photoRoutes = require("./routes/photoRoutes");
+const deviceRoutes = require("./routes/deviceRoutes");
 const auditLogRoutes = require("./routes/auditLogRoutes");
 const dashboardRoutes = require("./routes/dashboardRoutes");
 const aiChatRoutes = require("./routes/aiChatRoutes");
@@ -32,7 +34,53 @@ const agentRoutes = require("./routes/agentRoutes");
 
 const app = express();
 
-app.use(helmet());
+/**
+ * SECURITY HEADERS, MINUS ONE DIRECTIVE THAT BREAKS PLAIN-HTTP DEPLOYMENTS.
+ *
+ * helmet's default CSP includes `upgrade-insecure-requests`, which tells the
+ * browser to rewrite every http:// subresource request to https://. Browsers
+ * treat localhost and 127.0.0.1 as trustworthy origins and EXEMPT them, so
+ * this is invisible during development.
+ *
+ * It is not invisible on a LAN address. Opening the app from a second machine
+ * at http://192.168.1.101:5000 got every asset request upgraded to https on a
+ * server that does not speak TLS, so the JavaScript never loaded and the page
+ * rendered blank -- with the correct title, since the HTML itself had already
+ * arrived. Nothing in the console, nothing in the server log: the requests
+ * failed before they were made.
+ *
+ * So the directive is emitted only when the app really is behind TLS. Set
+ * SERVE_OVER_HTTPS=true when terminating TLS in front of this process (a
+ * reverse proxy, a tunnel); leave it unset for the ordinary self-hosted case
+ * of reaching it over http on your own network. Every other CSP protection is
+ * unchanged either way.
+ */
+const SERVE_OVER_HTTPS = process.env.SERVE_OVER_HTTPS === "true";
+
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        // blob: is REQUIRED for any image in this app to render.
+        //
+        // Previews are fetched through the API client so the JWT can be
+        // attached (a bare <img src="/api/..."> cannot carry an Authorization
+        // header), and the response is turned into an object URL. Those are
+        // blob: URLs, which helmet's default `img-src 'self' data:` does not
+        // permit -- so every photo silently failed to decode: the fetch
+        // succeeded, the <img> was created, and the browser refused to paint
+        // it. Broken tiles with no error anywhere except the CSP report.
+        imgSrc: ["'self'", "data:", "blob:"],
+        // Same reasoning for anything opened in a frame (PDF preview) and for
+        // media, both of which go through the same authenticated-fetch route.
+        mediaSrc: ["'self'", "blob:"],
+        frameSrc: ["'self'", "blob:"],
+        ...(SERVE_OVER_HTTPS ? {} : { upgradeInsecureRequests: null }),
+      },
+    },
+  })
+);
 
 // CORS was `cors()` with no options, i.e. Access-Control-Allow-Origin: * --
 // every website on the internet allowed to call this API from a visitor's
@@ -98,6 +146,8 @@ app.use("/api/duplicate-groups", apiLimiter, duplicateGroupRoutes);
 app.use("/api/rename-proposals", apiLimiter, renameProposalRoutes);
 app.use("/api/processing-jobs", apiLimiter, processingJobRoutes);
 app.use("/api/triage", apiLimiter, triageRoutes);
+app.use("/api/photos", apiLimiter, photoRoutes);
+app.use("/api/devices", apiLimiter, deviceRoutes);
 app.use("/api/audit-logs", apiLimiter, auditLogRoutes);
 app.use("/api/dashboard", apiLimiter, dashboardRoutes);
 app.use("/api/ai", apiLimiter, aiChatRoutes);
@@ -121,7 +171,33 @@ const FRONTEND_DIST = path.resolve(__dirname, "..", "..", "frontend", "dist");
 const hasBuiltFrontend = fs.existsSync(path.join(FRONTEND_DIST, "index.html"));
 
 if (hasBuiltFrontend) {
-  app.use(express.static(FRONTEND_DIST));
+  app.use(
+    express.static(FRONTEND_DIST, {
+      // index.html must NEVER be cached; the hashed assets it points at
+      // should be cached forever. Getting this backwards is what produced a
+      // permanently blank page on a second machine:
+      //
+      //   1. the laptop loads the app and caches index.html
+      //   2. the frontend is rebuilt here, so the asset hashes change
+      //   3. the laptop re-uses its cached index.html and asks for the OLD
+      //      hash, which no longer exists
+      //   4. the SPA catch-all answers that miss with index.html
+      //   5. the browser is handed HTML where it expected JavaScript, refuses
+      //      to execute it, and renders nothing -- with the correct title,
+      //      because that came from the cached HTML
+      //
+      // The page looked broken in a way no error message explained. Vite
+      // fingerprints every asset filename, so `immutable` is safe for them
+      // and correct: the content behind a given hash can never change.
+      setHeaders(res, filePath) {
+        if (filePath.endsWith("index.html")) {
+          res.setHeader("Cache-Control", "no-cache, must-revalidate");
+        } else if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+          res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+        }
+      },
+    })
+  );
 }
 
 // 404 for unmatched API routes. Kept scoped to /api so a client-side route
@@ -134,8 +210,37 @@ app.use("/api", (req, res) => {
 if (hasBuiltFrontend) {
   // Everything else is a React Router path: hand back index.html and let the
   // client router resolve it.
+  //
+  // EXCEPT anything that is asking for a FILE. A request for
+  // /assets/index-OLDHASH.js is a stale build reference, not a client-side
+  // route, and answering it with index.html is actively harmful: the browser
+  // receives HTML with a JavaScript content type, refuses to run it, and the
+  // app renders as a blank page whose title is right because it came from the
+  // cached HTML. A 404 is both true and diagnosable -- it shows up plainly in
+  // the network tab instead of as an inexplicable white screen.
+  //
+  // "Looks like a file" is deliberately narrow: a dot in the LAST path
+  // segment. React Router paths in this app are word segments and uuids
+  // (/files/2f1c-...), none of which contain dots, while every real asset
+  // does.
+  const looksLikeFile = (urlPath) => {
+    const last = urlPath.split("/").pop() || "";
+    return last.includes(".");
+  };
+
   app.use((req, res, next) => {
     if (req.method !== "GET") return next();
+
+    if (req.path.startsWith("/assets/") || looksLikeFile(req.path)) {
+      return res.status(404).type("text/plain").send(
+        `Not found: ${req.path}\n\n` +
+        "If this is /assets/index-<hash>.js, your browser is using a cached index.html " +
+        "from an older build and asking for a file that no longer exists. A hard refresh " +
+        "(Ctrl+Shift+R) fixes it; the server now sends no-cache on index.html so it should " +
+        "not recur."
+      );
+    }
+
     res.sendFile(path.join(FRONTEND_DIST, "index.html"));
   });
 }

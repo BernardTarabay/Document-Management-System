@@ -15,7 +15,21 @@
 // (tests/fileFilters.test.js). It emits SQL fragments against the alias `f`
 // (the `files` table) and the parameter array they refer to; nothing here
 // ever interpolates a user value into SQL.
+//
+// OWNERSHIP RIDES ALONG WITH THE FILTERS, AND IS NOT OPTIONAL
+//
+// The paragraph above -- "four hand-written copies is four chances to
+// disagree" -- applies with far more force to `owner_user_id` than to file
+// type. A file-type filter that goes missing shows the user too many of their
+// OWN files, which they will notice immediately. An owner predicate that goes
+// missing shows them somebody else's, which looks exactly like working
+// software.
+//
+// So the owner is part of the filter object, it is validated at parse time,
+// and buildFilterClauses emits it first and unconditionally. There is no code
+// path through this module that produces SQL without it.
 const { ValidationError } = require("../validators/validationError");
+const { requireOwner } = require("./ownership");
 
 /** The sentinel for "files with no extension at all" -- see parseExtensions. */
 const NO_EXTENSION = "none";
@@ -81,12 +95,14 @@ function parseUuid(raw, label) {
  * exactly which parameter was wrong.
  *
  * @param {object} query - req.query
- * @returns {{extensions: string[], dateFrom: string|null, dateTo: string|null,
- *            subjectId: string|null, storageLocationId: string|null,
- *            pathPrefix: string|null}}
+ * @param {string} ownerUserId - req.user.id. Required: see the header note.
+ * @returns {{ownerUserId: string, extensions: string[], dateFrom: string|null,
+ *            dateTo: string|null, subjectId: string|null,
+ *            storageLocationId: string|null, pathPrefix: string|null}}
  */
-function parseFileFilters(query = {}) {
+function parseFileFilters(query = {}, ownerUserId) {
   const filters = {
+    ownerUserId: requireOwner(ownerUserId, "parseFileFilters"),
     extensions: parseExtensions(query.ext),
     dateFrom: parseDate(query.dateFrom, "dateFrom"),
     dateTo: parseDate(query.dateTo, "dateTo"),
@@ -134,6 +150,13 @@ function buildFilterClauses(filters, startIndex = 1) {
   const params = [];
   let n = startIndex;
   const bind = (value) => { params.push(value); return `$${n++}`; };
+
+  // First, always, and with no `if`. Every other clause in this function
+  // narrows a set the user is already entitled to see; this one is what makes
+  // that true. It throws rather than defaulting, because the only two
+  // possible defaults -- match nothing, or match everything -- are a broken
+  // page and a data breach respectively.
+  clauses.push(`f.owner_user_id = ${bind(requireOwner(filters?.ownerUserId, "buildFilterClauses"))}`);
 
   if (filters?.extensions?.length) {
     const real = filters.extensions.filter((e) => e !== NO_EXTENSION);

@@ -31,7 +31,7 @@ async function detectExact(file) {
   // group -- the duplicate the user dealt with reappeared on the Duplicates
   // page, and the reclaimable-bytes total counted bytes twice.
   // findProcessedTwinByHash already takes this care; this path did not.
-  const matches = (await fileRepository.findBySha256(file.sha256_hash))
+  const matches = (await fileRepository.findBySha256(file.sha256_hash, file.owner_user_id))
     .filter((m) => m.status !== "deleted");
   if (matches.length <= 1) {
     return { phase: "exact", duplicatesFound: false };
@@ -58,6 +58,11 @@ async function detectExact(file) {
   // exact by construction, and the unique index added in migration 027 means
   // the database decides who creates it.
   const group = await duplicateGroupRepository.findOrCreateExactGroup({
+    // The group belongs to whoever owns the bytes. Identical files in two
+    // different archives are two unrelated documents that happen to match,
+    // and one group spanning both would offer to "resolve" by keeping a copy
+    // neither user can see.
+    ownerUserId: file.owner_user_id,
     contentKey: file.sha256_hash,
     detectionMethod: DetectionMethod.HASH,
     confidenceLevel: ConfidenceLevel.HIGH,
@@ -130,6 +135,7 @@ async function detectProbable(file) {
   }
   if (!group) {
     group = await duplicateGroupRepository.createGroup({
+      ownerUserId: file.owner_user_id,
       groupType: DuplicateGroupType.PROBABLE,
       detectionMethod: DetectionMethod.CONTENT_SIMILARITY,
       // Capped at MEDIUM by similarityService.confidenceForScore: HIGH is

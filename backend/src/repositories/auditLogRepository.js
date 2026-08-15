@@ -57,6 +57,7 @@ async function countSince(action, since) {
   return rows[0].count;
 }
 
+
 /**
  * Deliberate, single exception to "audit rows are write-once" (see the
  * header comment on this file). The Audit Log page needs a working "clear"

@@ -1,8 +1,17 @@
 // Intelligent naming, human-reviewed (spec §10). Never blindly applied.
 const db = require("../config/database");
 const { createBaseRepository } = require("./baseRepository");
+const { requireOwner } = require("./ownership");
 
 const base = createBaseRepository("rename_proposals");
+
+// A proposal has no owner column of its own -- it belongs to whoever owns the
+// file it is about. Denormalising an owner onto it would be a second copy of
+// a fact that cannot change independently, and one more thing to keep in
+// sync; this EXISTS is cheap because files.id is the primary key.
+const OWNED_BY = (n) => `EXISTS (
+  SELECT 1 FROM files f WHERE f.id = rename_proposals.file_id AND f.owner_user_id = $${n}
+)`;
 
 // Each of these takes an optional `client` so a caller can run it inside a
 // transaction (see config/database.withTransaction). Default stays `db`, so
@@ -22,13 +31,52 @@ async function create({
   return rows[0];
 }
 
-async function listPending({ limit = 50, offset = 0 } = {}) {
+async function listPending(ownerUserId, { limit = 50, offset = 0 } = {}) {
+  requireOwner(ownerUserId, "renameProposals.listPending");
   const { rows } = await db.query(
-    `SELECT * FROM rename_proposals WHERE status = 'pending'
-     ORDER BY confidence_score DESC NULLS LAST, created_at ASC LIMIT $1 OFFSET $2`,
-    [limit, offset]
+    `SELECT * FROM rename_proposals
+      WHERE status = 'pending' AND ${OWNED_BY(3)}
+      ORDER BY confidence_score DESC NULLS LAST, created_at ASC LIMIT $1 OFFSET $2`,
+    [limit, offset, ownerUserId]
   );
   return rows;
+}
+
+/** Every proposal ever made for one file, newest first. */
+async function listForFile(fileId) {
+  const { rows } = await db.query(
+    "SELECT * FROM rename_proposals WHERE file_id = $1 ORDER BY created_at DESC",
+    [fileId]
+  );
+  return rows;
+}
+
+/**
+ * Decline every outstanding suggestion for one file.
+ *
+ * Distinct from cancelPendingForFile only in intent, and the distinction is
+ * worth keeping in the name: cancelling happens because the FILE went away,
+ * this happens because the user said the name it already has is right. Both
+ * land on 'rejected', which findRejectedMatch then uses to avoid re-proposing
+ * the same name for the same content later.
+ */
+async function rejectPendingForFile(fileId, reviewedBy) {
+  const { rows } = await db.query(
+    `UPDATE rename_proposals SET status = 'rejected', reviewed_by = $2, reviewed_at = now()
+      WHERE file_id = $1 AND status = 'pending' RETURNING id`,
+    [fileId, reviewedBy]
+  );
+  return rows.map((r) => r.id);
+}
+
+/** One proposal, only if the caller owns the file it describes. */
+async function findByIdForOwner(id, ownerUserId) {
+  requireOwner(ownerUserId, "renameProposals.findByIdForOwner");
+  const { rows } = await db.query(
+    `SELECT * FROM rename_proposals WHERE id = $1 AND ${OWNED_BY(2)}`,
+    [id, ownerUserId]
+  );
+  return rows[0] || null;
 }
 
 /**
@@ -36,11 +84,13 @@ async function listPending({ limit = 50, offset = 0 } = {}) {
  * a bug where those tabs called the generic base.list() (no WHERE clause at
  * all), so every tab showed every proposal regardless of status.
  */
-async function listByStatus(status, { limit = 50, offset = 0 } = {}) {
+async function listByStatus(status, ownerUserId, { limit = 50, offset = 0 } = {}) {
+  requireOwner(ownerUserId, "renameProposals.listByStatus");
   const { rows } = await db.query(
-    `SELECT * FROM rename_proposals WHERE status = $1
-     ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT $2 OFFSET $3`,
-    [status, limit, offset]
+    `SELECT * FROM rename_proposals
+      WHERE status = $1 AND ${OWNED_BY(4)}
+      ORDER BY reviewed_at DESC NULLS LAST, created_at DESC LIMIT $2 OFFSET $3`,
+    [status, limit, offset, ownerUserId]
   );
   return rows;
 }
@@ -134,13 +184,14 @@ async function cancelPendingForFile(fileId, reviewedBy) {
  * user commits and the approval itself, so the number they agreed to and
  * the set that gets approved come from the same query.
  */
-async function listPendingAboveConfidence(minConfidence, { limit = 1000 } = {}) {
+async function listPendingAboveConfidence(minConfidence, ownerUserId, { limit = 1000 } = {}) {
+  requireOwner(ownerUserId, "renameProposals.listPendingAboveConfidence");
   const { rows } = await db.query(
     `SELECT * FROM rename_proposals
-     WHERE status = 'pending' AND confidence_score >= $1
+     WHERE status = 'pending' AND confidence_score >= $1 AND ${OWNED_BY(3)}
      ORDER BY confidence_score DESC, created_at ASC
      LIMIT $2`,
-    [minConfidence, limit]
+    [minConfidence, limit, ownerUserId]
   );
   return rows;
 }
@@ -155,13 +206,14 @@ async function listPendingAboveConfidence(minConfidence, { limit = 1000 } = {}) 
  * they are noise, and clearing them one row at a time is what stops anyone
  * ever reaching the proposals that are actually worth a decision.
  */
-async function listPendingBelowConfidence(maxConfidence, { limit = 5000 } = {}) {
+async function listPendingBelowConfidence(maxConfidence, ownerUserId, { limit = 5000 } = {}) {
+  requireOwner(ownerUserId, "renameProposals.listPendingBelowConfidence");
   const { rows } = await db.query(
     `SELECT * FROM rename_proposals
-     WHERE status = 'pending' AND confidence_score <= $1
+     WHERE status = 'pending' AND confidence_score <= $1 AND ${OWNED_BY(3)}
      ORDER BY confidence_score ASC, created_at ASC
      LIMIT $2`,
-    [maxConfidence, limit]
+    [maxConfidence, limit, ownerUserId]
   );
   return rows;
 }
@@ -172,23 +224,32 @@ async function listPendingBelowConfidence(maxConfidence, { limit = 5000 } = {}) 
  * ones" -- and 3,000 round trips is both slow and half-failable.
  */
 async function rejectPendingBelowConfidence(maxConfidence, reviewedBy) {
+  // reviewedBy IS the owner here -- rejecting in bulk is only ever reachable
+  // from a signed-in request, and it must never reach past that account.
+  requireOwner(reviewedBy, "renameProposals.rejectPendingBelowConfidence");
   const { rows } = await db.query(
     `UPDATE rename_proposals
         SET status = 'rejected', reviewed_by = $2, reviewed_at = now()
-      WHERE status = 'pending' AND confidence_score <= $1
+      WHERE status = 'pending' AND confidence_score <= $1 AND ${OWNED_BY(2)}
       RETURNING id, file_id, confidence_score`,
     [maxConfidence, reviewedBy]
   );
   return rows;
 }
 
-async function countPending() {
-  const { rows } = await db.query("SELECT COUNT(*)::int AS count FROM rename_proposals WHERE status = 'pending'");
+async function countPending(ownerUserId) {
+  requireOwner(ownerUserId, "renameProposals.countPending");
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS count FROM rename_proposals
+      WHERE status = 'pending' AND ${OWNED_BY(1)}`,
+    [ownerUserId]
+  );
   return rows[0].count;
 }
 
 module.exports = {
-  ...base, create, listPending, listByStatus, review, markApplied, findRejectedMatch,
-  findPendingForFile, cancelPendingForFile, countPending, listPendingAboveConfidence,
+  ...base, create, listPending, listByStatus, listForFile, review, markApplied,
+  findRejectedMatch, findPendingForFile, cancelPendingForFile, rejectPendingForFile,
+  findByIdForOwner, countPending, listPendingAboveConfidence,
   listPendingBelowConfidence, rejectPendingBelowConfidence,
 };

@@ -1,11 +1,11 @@
 const duplicateGroupService = require("../services/duplicateGroupService");
 
 async function list(req, res) {
-  res.json(await duplicateGroupService.search(req.query));
+  res.json(await duplicateGroupService.search(req.query, req.user.id));
 }
 
 async function getOne(req, res) {
-  res.json(await duplicateGroupService.getById(req.params.id));
+  res.json(await duplicateGroupService.getById(req.params.id, req.user.id));
 }
 
 async function resolve(req, res) {

@@ -139,28 +139,17 @@ const env = {
     ? secret("TOKEN_ENCRYPTION_KEY")
     : undefined,
 
-  // Email inbox triage (docs/10-email-inbox.md). Both providers are
-  // OAuth2-only -- there's no password-based path -- so each needs an app
-  // registered in the provider's own console before ANY account can be
-  // connected. Leaving a provider's clientId unset just means "Connect
-  // Gmail"/"Connect Outlook" 400s with a clear message instead of that
-  // provider being offered; it doesn't block the other provider or
-  // anything else in the app.
+  // Email inbox triage (docs/10-email-inbox.md). Gmail is the only provider;
+  // the Outlook/Microsoft Graph one was removed. It is OAuth2-only -- there is
+  // no password-based path -- so an app must be registered in Google Cloud
+  // Console before any account can be connected. Leaving clientId unset means
+  // "Connect Gmail" 400s with a clear message; it blocks nothing else.
   email: {
     syncIntervalMinutes: parseInt(process.env.EMAIL_SYNC_INTERVAL_MINUTES || "15", 10),
     google: {
       clientId: process.env.GOOGLE_OAUTH_CLIENT_ID,
       clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
       redirectUri: process.env.GOOGLE_OAUTH_REDIRECT_URI,
-    },
-    microsoft: {
-      clientId: process.env.MICROSOFT_OAUTH_CLIENT_ID,
-      clientSecret: process.env.MICROSOFT_OAUTH_CLIENT_SECRET,
-      // 'common' accepts both personal Microsoft accounts and any
-      // work/school (Azure AD) tenant -- the standard choice unless the
-      // app is meant to be restricted to one specific organization.
-      tenantId: process.env.MICROSOFT_OAUTH_TENANT_ID || "common",
-      redirectUri: process.env.MICROSOFT_OAUTH_REDIRECT_URI,
     },
   },
 

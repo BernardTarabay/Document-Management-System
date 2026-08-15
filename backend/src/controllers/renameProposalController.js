@@ -2,7 +2,7 @@ const renameProposalService = require("../services/renameProposalService");
 const { ProposalStatus } = require("../models/enums");
 
 async function list(req, res) {
-  res.json(await renameProposalService.search(req.query));
+  res.json(await renameProposalService.search(req.query, req.user.id));
 }
 
 async function approve(req, res) {
@@ -23,12 +23,12 @@ async function bulkApply(req, res) {
 }
 
 async function pendingCount(req, res) {
-  res.json({ count: await renameProposalService.pendingCount() });
+  res.json({ count: await renameProposalService.pendingCount(req.user.id) });
 }
 
 /** Dry run: how many pending proposals a threshold would approve. */
 async function countAboveConfidence(req, res) {
-  res.json(await renameProposalService.countPendingAboveConfidence(req.query.minConfidence));
+  res.json(await renameProposalService.countPendingAboveConfidence(req.query.minConfidence, req.user.id));
 }
 
 async function approveAboveConfidence(req, res) {
@@ -38,7 +38,7 @@ async function approveAboveConfidence(req, res) {
 
 /** Dry run: how many pending proposals a threshold would discard. */
 async function countBelowConfidence(req, res) {
-  res.json(await renameProposalService.countPendingBelowConfidence(req.query.maxConfidence));
+  res.json(await renameProposalService.countPendingBelowConfidence(req.query.maxConfidence, req.user.id));
 }
 
 async function rejectBelowConfidence(req, res) {

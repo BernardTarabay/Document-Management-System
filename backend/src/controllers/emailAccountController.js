@@ -11,7 +11,7 @@ async function connect(req, res) {
 }
 
 /**
- * Hit directly by Google/Microsoft's own redirect -- no Authorization
+ * Hit directly by Google's own redirect -- no Authorization
  * header exists on this request (it's a top-level browser navigation
  * initiated by the provider, not an API call from our own frontend JS), so
  * this always ends in a redirect back to the frontend rather than a JSON

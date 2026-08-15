@@ -83,19 +83,29 @@ export function StorageLocationsPage() {
         title="Storage locations"
         description="Folders this app indexes, wherever they live — local disk, external drive, cloud-synced folder. Files are read where they are and never copied here."
         actions={
-          hasPermission("user.manage") && (
-            <>
-              <button className="btn-ghost btn-sm" onClick={reload} disabled={loading} title="Reload">
-                <RefreshCw size={13} className={loading ? "animate-spin" : ""} /> Refresh
-              </button>
-              {/* Straight to the folder browser rather than a blank form --
-                  typing an absolute path by hand was the friction that made
-                  drag-and-drop look attractive in the first place. */}
+          <>
+            {/* Reloading a list you can already see is not privileged. This
+                used to sit behind the same gate as adding a folder, which
+                left a read-only account with no way to refresh at all. */}
+            <button className="btn-ghost btn-sm" onClick={reload} disabled={loading} title="Reload">
+              <RefreshCw size={13} className={loading ? "animate-spin" : ""} /> Refresh
+            </button>
+            {/* `storage.manage`, NOT `user.manage`.
+                This gate was the reason a normal account could not register a
+                folder even after the backend permissions were fixed: the
+                button was simply never rendered. `user.manage` governs
+                administering OTHER PEOPLE'S ACCOUNTS; pointing this app at
+                your own folder is an ordinary user action, and every query
+                behind it is scoped to the caller. */}
+            {hasPermission("storage.manage") && (
+              /* Straight to the folder browser rather than a blank form --
+                 typing an absolute path by hand was the friction that made
+                 drag-and-drop look attractive in the first place. */
               <button className="btn-primary btn-sm" onClick={browseForFolder}>
                 <FolderSearch size={14} /> Add folder
               </button>
-            </>
-          )
+            )}
+          </>
         }
       />
 
@@ -109,7 +119,7 @@ export function StorageLocationsPage() {
           title="No folders registered yet"
           description="Point the app at a folder and it indexes the files where they are — nothing is copied, and by default nothing is renamed or moved on disk."
           action={
-            hasPermission("user.manage") ? (
+            hasPermission("storage.manage") ? (
               <button className="btn-primary btn-sm" onClick={browseForFolder}>
                 <FolderSearch size={14} /> Browse for a folder
               </button>
@@ -120,7 +130,7 @@ export function StorageLocationsPage() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {locations.map((loc) => (
             <div key={loc.id} className="glass-card animate-fade-in-up relative p-5">
-              {hasPermission("user.manage") && (
+              {hasPermission("storage.manage") && (
                 <button
                   className="absolute right-3 top-3 rounded-lg p-1 text-base-500 hover:bg-white/5 hover:text-rose-300"
                   onClick={() => setRemoveTarget(loc)}
@@ -182,13 +192,18 @@ export function StorageLocationsPage() {
                   mode was unimplemented. The scan still fails cleanly with a
                   503 if no agent is connected, which is the honest place for
                   that to surface. */}
-              <button
-                className="btn-secondary btn-sm mt-4 w-full"
-                disabled={scanningId === loc.id}
-                onClick={() => triggerScan(loc.id)}
-              >
-                <PlayCircle size={13} /> {scanningId === loc.id ? "Starting…" : "Run scan"}
-              </button>
+              {/* Matches the route's own bar (`scan.run`). This was ungated,
+                  so an account without it saw a button that 403s -- an action
+                  offered and then refused is worse than one not offered. */}
+              {hasPermission("scan.run") && (
+                <button
+                  className="btn-secondary btn-sm mt-4 w-full"
+                  disabled={scanningId === loc.id}
+                  onClick={() => triggerScan(loc.id)}
+                >
+                  <PlayCircle size={13} /> {scanningId === loc.id ? "Starting…" : "Run scan"}
+                </button>
+              )}
             </div>
           ))}
         </div>

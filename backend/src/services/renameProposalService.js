@@ -3,6 +3,8 @@ const auditLogRepository = require("../repositories/auditLogRepository");
 const { enqueueJob } = require("../queues");
 const { parsePagination } = require("../utils/pagination");
 const { ValidationError } = require("../validators/validationError");
+const pipelineState = require("./pipelineState");
+const { requireOwner } = require("../repositories/ownership");
 const { JobType, ProposalStatus } = require("../models/enums");
 
 class NotFoundError extends Error {
@@ -13,25 +15,56 @@ class NotFoundError extends Error {
   }
 }
 
-async function search(query) {
+async function search(query, ownerUserId) {
+  requireOwner(ownerUserId, "renameProposalService.search");
   const { limit, offset } = parsePagination(query);
   const status = query.status || ProposalStatus.PENDING;
-  if (status === ProposalStatus.PENDING) return renameProposalRepository.listPending({ limit, offset });
+  if (status === ProposalStatus.PENDING) return renameProposalRepository.listPending(ownerUserId, { limit, offset });
   // Bug fix: this used to call the generic, unfiltered base.list() for
   // every non-pending status, which returned ALL proposals regardless of
   // status -- so the approved/rejected/applied tabs all showed the same
   // full set instead of being filtered. listByStatus() actually filters.
-  return renameProposalRepository.listByStatus(status, { limit, offset });
+  return renameProposalRepository.listByStatus(status, ownerUserId, { limit, offset });
 }
 
+/**
+ * Approve or reject one proposal.
+ *
+ * WHAT REJECTING MEANS -- THE POINT WORTH BEING EXPLICIT ABOUT
+ *
+ * Rejecting a rename rejects THE NAME, never the file. It means "the name
+ * this document already has is the right one", and it is a FINISHED state,
+ * not a problem to come back to:
+ *
+ *   - the file keeps filename_current, untouched
+ *   - the pipeline continues; nothing is cancelled
+ *   - it stays filed under its subject and still appears in the organized
+ *     mirror under its original name (fileRepository.listForMirror takes a
+ *     canonical name OR a subject, precisely so a rejected rename does not
+ *     make a document vanish from the only browsable view)
+ *   - it is NOT sent to triage, NOT marked failed, and the user is NOT asked
+ *     to decide again
+ *
+ * The markUserResolved call below is what enforces the last point. Before it,
+ * a rejected proposal left the file matching triage's "could not be named"
+ * predicate, so declining a suggestion put the document straight into the
+ * queue of things needing attention -- the exact opposite of what the user
+ * just said.
+ */
 async function review(id, status, actorUserId) {
-  const proposal = await renameProposalRepository.findById(id);
+  const proposal = await renameProposalRepository.findByIdForOwner(id, actorUserId);
   if (!proposal) throw new NotFoundError("Rename proposal not found.");
   if (proposal.status !== ProposalStatus.PENDING) {
     throw new ValidationError(`Proposal is already ${proposal.status}, not pending.`);
   }
 
   const updated = await renameProposalRepository.review(id, { status, reviewedBy: actorUserId });
+
+  if (status === ProposalStatus.REJECTED) {
+    // Settled, by the user, deliberately. Recorded so nothing downstream
+    // treats "has no canonical name" as "still needs a decision".
+    await pipelineState.markUserResolved(proposal.file_id, "kept_name");
+  }
 
   await auditLogRepository.record({
     userId: actorUserId,
@@ -40,6 +73,10 @@ async function review(id, status, actorUserId) {
     entityId: id,
     previousState: { status: "pending" },
     newState: { status },
+    reason: status === ProposalStatus.REJECTED
+      ? `The suggested name was declined; "${proposal.current_filename}" is kept. The file is settled ` +
+        "and continues normally -- rejecting a name never rejects the document."
+      : `Approved "${proposal.proposed_filename}" and queued it to be applied.`,
   });
 
   // Approving IS the decision to do this -- there's deliberately no separate
@@ -53,12 +90,18 @@ async function review(id, status, actorUserId) {
     const job = await enqueueJob(
       JobType.BULK_RENAME,
       { proposalIds: [id] },
-      { createdBy: actorUserId, progressTotal: 1 }
+      { createdBy: actorUserId, ownerUserId: actorUserId, progressTotal: 1 }
     );
     return { ...updated, applyJobId: job.id };
   }
 
-  return updated;
+  return {
+    ...updated,
+    // Said in the response, not only in the audit log, so the UI can show the
+    // outcome rather than leaving the user to wonder what rejecting did.
+    outcome: "original_name_kept",
+    keptFilename: proposal.current_filename,
+  };
 }
 
 /**
@@ -70,7 +113,7 @@ async function review(id, status, actorUserId) {
  * orphan it.
  */
 async function retry(id, actorUserId) {
-  const proposal = await renameProposalRepository.findById(id);
+  const proposal = await renameProposalRepository.findByIdForOwner(id, actorUserId);
   if (!proposal) throw new NotFoundError("Rename proposal not found.");
   if (proposal.status === ProposalStatus.PENDING) {
     throw new ValidationError("Proposal is still pending -- approve or reject it first.");
@@ -87,7 +130,11 @@ async function retry(id, actorUserId) {
     reason: "Retried from the " + proposal.status + " tab -- re-running classification for the file.",
   });
 
-  const job = await enqueueJob(JobType.CLASSIFY, { fileId: proposal.file_id }, { createdBy: actorUserId });
+  const job = await enqueueJob(
+    JobType.CLASSIFY,
+    { fileId: proposal.file_id },
+    { createdBy: actorUserId, ownerUserId: actorUserId }
+  );
   return { retried: true, fileId: proposal.file_id, jobId: job.id };
 }
 
@@ -101,7 +148,18 @@ async function bulkApply(proposalIds, actorUserId) {
   if (!Array.isArray(proposalIds) || proposalIds.length === 0) {
     throw new ValidationError("proposalIds must be a non-empty array.");
   }
-  const job = await enqueueJob(JobType.BULK_RENAME, { proposalIds }, { createdBy: actorUserId, progressTotal: proposalIds.length });
+  // Filtered to the caller's own before anything is queued. Without this a
+  // hand-written id list would apply renames to another account's files --
+  // and bulkRenameProcessor, whose job is to check the proposal is approved,
+  // would happily confirm that it was.
+  const owned = [];
+  for (const id of proposalIds) {
+    if (await renameProposalRepository.findByIdForOwner(id, actorUserId)) owned.push(id);
+  }
+  if (owned.length === 0) throw new ValidationError("None of those proposals are yours to apply.");
+  proposalIds = owned;
+
+  const job = await enqueueJob(JobType.BULK_RENAME, { proposalIds }, { createdBy: actorUserId, ownerUserId: actorUserId, progressTotal: proposalIds.length });
 
   await auditLogRepository.record({
     userId: actorUserId,
@@ -114,8 +172,8 @@ async function bulkApply(proposalIds, actorUserId) {
   return job;
 }
 
-async function pendingCount() {
-  return renameProposalRepository.countPending();
+async function pendingCount(ownerUserId) {
+  return renameProposalRepository.countPending(ownerUserId);
 }
 
 /**
@@ -146,9 +204,10 @@ function parseConfidence(value) {
 
 /** How many pending proposals a threshold would catch -- shown before the
  *  user commits, so "approve everything above 90%" is never a blind click. */
-async function countPendingAboveConfidence(minConfidence) {
-  const rows = await renameProposalRepository.listPendingAboveConfidence(parseConfidence(minConfidence));
-  return { minConfidence: parseConfidence(minConfidence), count: rows.length };
+async function countPendingAboveConfidence(minConfidence, ownerUserId) {
+  const min = parseConfidence(minConfidence);
+  const rows = await renameProposalRepository.listPendingAboveConfidence(min, ownerUserId);
+  return { minConfidence: min, count: rows.length };
 }
 
 /**
@@ -162,7 +221,7 @@ async function countPendingAboveConfidence(minConfidence) {
  */
 async function approveAboveConfidence(minConfidence, actorUserId) {
   const min = parseConfidence(minConfidence);
-  const matching = await renameProposalRepository.listPendingAboveConfidence(min);
+  const matching = await renameProposalRepository.listPendingAboveConfidence(min, actorUserId);
 
   if (matching.length === 0) {
     return { approved: 0, minConfidence: min, job: null };
@@ -176,7 +235,7 @@ async function approveAboveConfidence(minConfidence, actorUserId) {
   const job = await enqueueJob(
     JobType.BULK_RENAME,
     { proposalIds },
-    { createdBy: actorUserId, progressTotal: proposalIds.length }
+    { createdBy: actorUserId, ownerUserId: actorUserId, progressTotal: proposalIds.length }
   );
 
   await auditLogRepository.record({
@@ -196,9 +255,9 @@ async function approveAboveConfidence(minConfidence, actorUserId) {
 /** How many pending proposals a "clear the junk" threshold would discard.
  *  Shown before committing, so the count agreed to and the set rejected come
  *  from the same predicate. */
-async function countPendingBelowConfidence(maxConfidence) {
+async function countPendingBelowConfidence(maxConfidence, ownerUserId) {
   const max = parseConfidence(maxConfidence);
-  const rows = await renameProposalRepository.listPendingBelowConfidence(max);
+  const rows = await renameProposalRepository.listPendingBelowConfidence(max, ownerUserId);
   return { maxConfidence: max, count: rows.length };
 }
 
@@ -220,6 +279,13 @@ async function countPendingBelowConfidence(maxConfidence) {
 async function rejectBelowConfidence(maxConfidence, actorUserId) {
   const max = parseConfidence(maxConfidence);
   const rejected = await renameProposalRepository.rejectPendingBelowConfidence(max, actorUserId);
+
+  // Each rejection means the same thing as a single one: this file keeps the
+  // name it has, and is finished. Marking them resolved is what stops three
+  // thousand cleared proposals reappearing as three thousand triage entries.
+  for (const row of rejected) {
+    await pipelineState.markUserResolved(row.file_id, "kept_name").catch(() => {});
+  }
 
   if (rejected.length > 0) {
     await auditLogRepository.record({

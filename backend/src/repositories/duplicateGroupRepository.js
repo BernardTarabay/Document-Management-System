@@ -1,14 +1,17 @@
 // Safe deduplication (see docs/01-domain-model.md §1.3, spec §13).
 const db = require("../config/database");
 const { createBaseRepository } = require("./baseRepository");
+const { requireOwner, ownedRepository } = require("./ownership");
 
 const base = createBaseRepository("duplicate_groups");
+const owned = ownedRepository(db, "duplicate_groups");
 
-async function createGroup({ groupType, detectionMethod, confidenceLevel = null, confidenceScore = null }) {
+async function createGroup({ ownerUserId, groupType, detectionMethod, confidenceLevel = null, confidenceScore = null }) {
+  requireOwner(ownerUserId, "duplicateGroups.createGroup");
   const { rows } = await db.query(
-    `INSERT INTO duplicate_groups (group_type, detection_method, confidence_level, confidence_score)
-     VALUES ($1,$2,$3,$4) RETURNING *`,
-    [groupType, detectionMethod, confidenceLevel, confidenceScore]
+    `INSERT INTO duplicate_groups (owner_user_id, group_type, detection_method, confidence_level, confidence_score)
+     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [ownerUserId, groupType, detectionMethod, confidenceLevel, confidenceScore]
   );
   return rows[0];
 }
@@ -25,15 +28,26 @@ async function createGroup({ groupType, detectionMethod, confidenceLevel = null,
  * DO UPDATE rather than DO NOTHING because DO NOTHING returns no row on
  * conflict, which is precisely the case that needs the existing group.
  * Assigning content_key to itself is the cheapest no-op that still RETURNs.
+ *
+ * THE CONFLICT TARGET IS (owner_user_id, content_key), NOT content_key ALONE.
+ *
+ * It has to match the unique index exactly or Postgres raises "no unique or
+ * exclusion constraint matching the ON CONFLICT specification" at runtime.
+ * Migration 029 widened that index to include the owner, because a global one
+ * was a cross-tenant collision: two accounts holding the same PDF would fight
+ * over one group row, and the loser's copy would be filed into a stranger's
+ * duplicate group.
  */
-async function findOrCreateExactGroup({ contentKey, detectionMethod, confidenceLevel, confidenceScore }) {
+async function findOrCreateExactGroup({ ownerUserId, contentKey, detectionMethod, confidenceLevel, confidenceScore }) {
+  requireOwner(ownerUserId, "duplicateGroups.findOrCreateExactGroup");
   const { rows } = await db.query(
-    `INSERT INTO duplicate_groups (group_type, detection_method, confidence_level, confidence_score, content_key)
-     VALUES ('exact', $1, $2, $3, $4)
-     ON CONFLICT (content_key) WHERE group_type = 'exact' AND content_key IS NOT NULL
+    `INSERT INTO duplicate_groups
+       (owner_user_id, group_type, detection_method, confidence_level, confidence_score, content_key)
+     VALUES ($1, 'exact', $2, $3, $4, $5)
+     ON CONFLICT (owner_user_id, content_key) WHERE group_type = 'exact' AND content_key IS NOT NULL
        DO UPDATE SET content_key = EXCLUDED.content_key
      RETURNING *`,
-    [detectionMethod, confidenceLevel, confidenceScore, contentKey]
+    [ownerUserId, detectionMethod, confidenceLevel, confidenceScore, contentKey]
   );
   return rows[0];
 }
@@ -123,26 +137,46 @@ async function setCanonicalFile(duplicateGroupId, fileId, resolvedBy) {
  *   §1.3), so sweeping them into an automated resolve would be exactly the
  *   thing that section forbids.
  */
-async function listOpen({ limit = 50, offset = 0, groupType = null } = {}) {
+async function listOpen(ownerUserId, { limit = 50, offset = 0, groupType = null } = {}) {
+  requireOwner(ownerUserId, "duplicateGroups.listOpen");
   const { rows } = await db.query(
     `SELECT * FROM duplicate_groups
-     WHERE status = 'open' AND ($3::duplicate_group_type IS NULL OR group_type = $3)
+     WHERE status = 'open' AND owner_user_id = $4
+       AND ($3::duplicate_group_type IS NULL OR group_type = $3)
      ORDER BY created_at ASC LIMIT $1 OFFSET $2`,
-    [limit, offset, groupType]
+    [limit, offset, groupType, ownerUserId]
   );
   return rows;
 }
 
+/** One group, only if it is the caller's. */
+async function findByIdForOwner(id, ownerUserId) {
+  requireOwner(ownerUserId, "duplicateGroups.findByIdForOwner");
+  const { rows } = await db.query(
+    "SELECT * FROM duplicate_groups WHERE id = $1 AND owner_user_id = $2",
+    [id, ownerUserId]
+  );
+  return rows[0] || null;
+}
+
 /** Cheap count for progress totals (auto-resolve-all job sizing). */
-async function countOpen(groupType = null) {
+async function countOpen(ownerUserId, groupType = null) {
+  requireOwner(ownerUserId, "duplicateGroups.countOpen");
   const { rows } = await db.query(
     `SELECT COUNT(*)::int AS count FROM duplicate_groups
-     WHERE status = 'open' AND ($1::duplicate_group_type IS NULL OR group_type = $1)`,
-    [groupType]
+     WHERE status = 'open' AND owner_user_id = $2
+       AND ($1::duplicate_group_type IS NULL OR group_type = $1)`,
+    [groupType, ownerUserId]
   );
   return rows[0].count;
 }
 
+/**
+ * Unscoped by design: the caller has already resolved `fileId` through an
+ * owner-scoped read, and a group containing that file necessarily belongs to
+ * the same account -- duplicate_groups.owner_user_id is derived from its
+ * members. An owner argument here would be ceremony without a boundary.
+ */
 async function findGroupContainingFile(fileId) {
   const { rows } = await db.query(
     `SELECT dg.* FROM duplicate_groups dg
@@ -154,6 +188,6 @@ async function findGroupContainingFile(fileId) {
 }
 
 module.exports = {
-  ...base, createGroup, findOrCreateExactGroup, addMember, listMembers,
-  setCanonicalFile, listOpen, countOpen, findGroupContainingFile,
+  ...base, ...owned, createGroup, findOrCreateExactGroup, addMember, listMembers,
+  setCanonicalFile, listOpen, countOpen, findGroupContainingFile, findByIdForOwner,
 };

@@ -17,6 +17,7 @@ const renameProposalRepository = require("../../repositories/renameProposalRepos
 const storageLocationRepository = require("../../repositories/storageLocationRepository");
 const auditLogRepository = require("../../repositories/auditLogRepository");
 const { buildCanonicalName, buildTargetRelativeDir } = require("../../services/namingService");
+const pipelineState = require("../../services/pipelineState");
 const { ConfidenceLevel, JobType } = require("../../models/enums");
 const { enqueueJob } = require("../../queues");
 const env = require("../../config/env");
@@ -93,6 +94,11 @@ async function handle({ fileId }) {
     return { skipped: true, reason: "file not active" };
   }
 
+  // generate_names is the LAST stage of the document pipeline, so whatever it
+  // decides is this file's final machine-determined state. Every exit below
+  // records one, because a file whose state never moves off 'discovered' looks
+  // permanently unstarted no matter how much work was actually done to it.
+
   const [classifications, fileMetadata, content] = await Promise.all([
     classificationResultRepository.listProposedForFile(fileId),
     fileMetadataRepository.findByFile(fileId),
@@ -129,6 +135,14 @@ async function handle({ fileId }) {
         "proposed name would be invented rather than read from the document." +
         (content.needs_ocr ? " OCR would likely make it nameable." : ""),
     });
+    // A person has to name this one -- the machine has correctly declined to
+    // invent a name from noise. NEEDS_USER, not failed: nothing went wrong.
+    await pipelineState.markNeedsUser(
+      fileId, "generate_names",
+      content.needs_ocr
+        ? "The text could not be read. OCR would probably make this nameable."
+        : "The text came back unusable, so Atlas will not invent a name. Name it yourself."
+    );
     return {
       skipped: true,
       reason: `text unusable (${content.text_quality}); keeping the original filename`,
@@ -161,6 +175,9 @@ async function handle({ fileId }) {
   const bestTitle = titleSource === "embedded" ? embeddedTitle : titleSource === "ai" ? file.ai_short_title : null;
 
   if (!latest || (latest.confidence_level === ConfidenceLevel.LOW && !bestTitle)) {
+    // Settled: it keeps the name it has. That is a finished outcome, not a
+    // pending one -- see the note on rejected proposals in renameProposalService.
+    await pipelineState.markCompleted(fileId, "generate_names");
     return { skipped: true, reason: "no sufficiently confident classification to name from" };
   }
 
@@ -172,6 +189,7 @@ async function handle({ fileId }) {
   // Nothing to name from AND nowhere to file it -- there is no proposal to
   // make. (A subject with no title is still worth a proposal: the move.)
   if (!subject && !bestTitle) {
+    await pipelineState.markCompleted(fileId, "generate_names");
     return { skipped: true, reason: "no usable title and no subject to file under; keeping the original name" };
   }
 
@@ -222,6 +240,9 @@ async function handle({ fileId }) {
   const nameUnchanged = proposedFilename === file.filename_current;
   const noMoveNeeded = !proposedRelativeDir;
   if (nameUnchanged && noMoveNeeded) {
+    // Nothing to change: the file already has the name and place the
+    // classifier would propose. Finished, not pending.
+    await pipelineState.markCompleted(fileId, "generate_names");
     return { skipped: true, reason: "proposed name and folder both match the current state" };
   }
 
@@ -240,6 +261,9 @@ async function handle({ fileId }) {
       entityId: fileId,
       reason: `Identical rename/move to "${proposedFilename}"${proposedRelativeDir ? ` in "${proposedRelativeDir}"` : ""} was already rejected (proposal ${rejectedMatch.id}); not re-proposing without a real change.`,
     });
+    // The user already declined exactly this suggestion. Their decision
+    // stands and the file is settled -- see renameProposalService.review.
+    await pipelineState.markCompleted(fileId, "generate_names");
     return { skipped: true, reason: "identical rename/move already rejected", rejectedProposalId: rejectedMatch.id };
   }
 
@@ -257,6 +281,10 @@ async function handle({ fileId }) {
     (p) => p.proposed_filename === proposedFilename && (p.proposed_relative_dir || null) === (proposedRelativeDir || null)
   );
   if (identicalPending) {
+    // A proposal is already waiting on the Rename proposals page. The
+    // PIPELINE is done with this file; the outstanding decision lives in that
+    // queue, not in triage.
+    await pipelineState.markCompleted(fileId, "generate_names");
     return { skipped: true, reason: "identical proposal already pending", pendingProposalId: identicalPending.id };
   }
   const namingReason = bestTitle
@@ -324,6 +352,16 @@ async function handle({ fileId }) {
   });
 
   const autoApplied = await maybeAutoApply(proposal, file, latest);
+
+  // The machine is done with this document either way.
+  //
+  // Auto-applied: finished outright. Proposal pending: finished as far as the
+  // PIPELINE goes -- the outstanding decision is a review on the Rename
+  // proposals page, which is its own queue and does not need this file to look
+  // unprocessed to be found. Marking it needs_user here would double-count it
+  // in triage, which is precisely the "same file in two worklists" confusion
+  // the state machine exists to prevent.
+  await pipelineState.markCompleted(fileId, "generate_names");
 
   return { renameProposalId: proposal.id, proposedFilename, proposedRelativeDir, autoApplied };
 }

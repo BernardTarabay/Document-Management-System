@@ -95,9 +95,26 @@ function NamingCell({ file }) {
   );
 }
 
+// Offered in the per-page selector. 25 stays the default -- it is what the
+// page was built around and what fits a laptop screen without scrolling the
+// header away.
+const PAGE_SIZES = [25, 50, 100, 200];
+
 export function FilesPage() {
   const [q, setQ] = useState("");
   const [offset, setOffset] = useState(0);
+  // Remembered across visits: someone who works at 100 rows a page is not
+  // choosing that once, they are stating a preference. Guarded because
+  // localStorage throws in private-mode Safari and a crash here would take
+  // the whole page down for a cosmetic setting.
+  const [limit, setLimit] = useState(() => {
+    try {
+      const saved = Number(window.localStorage.getItem("atlas.files.pageSize"));
+      return PAGE_SIZES.includes(saved) ? saved : LIMIT;
+    } catch {
+      return LIMIT;
+    }
+  });
   const [selectedId, setSelectedId] = useState(null);
   const [removeTarget, setRemoveTarget] = useState(null);
   const [removing, setRemoving] = useState(false);
@@ -139,9 +156,32 @@ export function FilesPage() {
   }, [q]);
 
   const { data: files, loading, error: filesError, reload, reloadSilently } = useApiData(
-    () => api.get("/files", { q: debouncedQ || undefined, limit: LIMIT, offset, ...filterParams }),
-    [debouncedQ, offset, filterKey]
+    () => api.get("/files", { q: debouncedQ || undefined, limit, offset, ...filterParams }),
+    [debouncedQ, offset, limit, filterKey]
   );
+
+  /**
+   * Anything that changes WHICH rows match has to send you back to page 1.
+   *
+   * Staying on page 7 after narrowing 9,000 files to 30 lands on an offset
+   * past the end, and an empty page is indistinguishable from "your filter
+   * matched nothing" -- the single most confusing state this page can be in.
+   * Guarded on `offset !== 0` so it does not fire a redundant re-render (and
+   * therefore a redundant fetch) when you are already on the first page,
+   * which is the common case.
+   */
+  useEffect(() => {
+    setOffset((current) => (current === 0 ? current : 0));
+  }, [debouncedQ, filterKey, limit]);
+
+  const changeLimit = (next) => {
+    setLimit(next);
+    try {
+      window.localStorage.setItem("atlas.files.pageSize", String(next));
+    } catch {
+      // A preference that cannot be saved is not worth failing over.
+    }
+  };
 
   // How many the filters match across the whole repository, not this page.
   // Skipped while a search term is active: counting a full-text search means
@@ -450,7 +490,15 @@ export function FilesPage() {
           {/* countData is deliberately absent while a search term is active (see
           fileService.count), so pageCount carries the "is there a next page?"
           answer in that case. */}
-      <Pagination offset={offset} limit={LIMIT} total={countData?.count ?? undefined} pageCount={files?.length} onChange={setOffset} />
+      <Pagination
+        offset={offset}
+        limit={limit}
+        total={countData?.count ?? undefined}
+        pageCount={files?.length}
+        onChange={setOffset}
+        pageSizes={PAGE_SIZES}
+        onLimitChange={changeLimit}
+      />
         </div>
       )}
 

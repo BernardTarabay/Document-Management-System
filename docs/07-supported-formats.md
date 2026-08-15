@@ -20,7 +20,7 @@ requirement not to rely on extensions alone.
 
 `utils/cfb.js` reads the compound-file container itself (FAT, mini-FAT, directory),
 hand-written rather than via SheetJS's `cfb` package — same "well-documented format,
-no vendor dependency" reasoning as using raw `fetch` instead of the Google/Microsoft
+no vendor dependency" reasoning as using raw `fetch` instead of the Google
 SDKs. Three format readers sit on top of it:
 
 - **`.doc`** (`ole/docText.js`) reads the **piece table** (FIB → Clx → PlcPcd) rather

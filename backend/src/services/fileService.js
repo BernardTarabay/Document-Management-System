@@ -22,6 +22,7 @@ const { enqueueJob } = require("../queues");
 const mime = require("../utils/mimeGuess");
 const thumbnailService = require("./preview/thumbnailService");
 const similarity = require("./similarityService");
+const fileOrganizeService = require("./fileOrganizeService");
 
 class NotFoundError extends Error {
   constructor(message) {
@@ -42,9 +43,9 @@ class NotFoundError extends Error {
  * ever matter here, that is a second, separate filter rather than a
  * reinterpretation of this one.
  */
-async function search(query) {
+async function search(query, ownerUserId) {
   const { limit, offset } = parsePagination(query);
-  const filters = parseFileFilters(query);
+  const filters = parseFileFilters(query, ownerUserId);
 
   // Search matches file CONTENT as well as names. This used to be
   // filename-only, which made the search box nearly useless for the thing
@@ -53,10 +54,10 @@ async function search(query) {
   // for callers that specifically want a name lookup.
   if (query.q) {
     return query.mode === "filename"
-      ? fileRepository.searchByFilename(query.q, { limit, offset })
+      ? fileRepository.searchByFilename(query.q, ownerUserId, { limit, offset })
       : fileRepository.searchEverything(query.q, { limit, offset, filters });
   }
-  if (query.status) return fileRepository.listByStatus(query.status, { limit, offset });
+  if (query.status) return fileRepository.listByStatus(query.status, ownerUserId, { limit, offset });
   // Default view -- excludes 'deleted' so removed files (single or bulk)
   // actually disappear instead of lingering with a "deleted" badge. See
   // fileRepository.listNotDeleted for why this isn't the generic list().
@@ -77,8 +78,8 @@ async function search(query) {
  * discard the rows would double the cost of every keystroke. With a search
  * term the honest thing to report is the page you are on.
  */
-async function count(query) {
-  const filters = parseFileFilters(query);
+async function count(query, ownerUserId) {
+  const filters = parseFileFilters(query, ownerUserId);
   if (query.q) {
     throw new ValidationError(
       "Counting is only available without a search term -- narrow with filters, or page through the results."
@@ -88,10 +89,10 @@ async function count(query) {
 }
 
 /** The values actually present to filter by -- see fileRepository.filterFacets. */
-async function filterOptions() {
+async function filterOptions(ownerUserId) {
   const [facets, locations] = await Promise.all([
-    fileRepository.filterFacets(),
-    storageLocationRepository.list({ limit: 200 }),
+    fileRepository.filterFacets(ownerUserId),
+    storageLocationRepository.listActive(ownerUserId),
   ]);
 
   return {
@@ -120,8 +121,8 @@ async function filterOptions() {
  * is for), latest classification, and duplicate-group membership -- so the
  * frontend never has to make five separate requests for one detail view.
  */
-async function getFileDetail(fileId) {
-  const file = await fileRepository.findById(fileId);
+async function getFileDetail(fileId, ownerUserId) {
+  const file = await fileRepository.findByIdForOwner(fileId, ownerUserId);
   if (!file) throw new NotFoundError("File not found.");
 
   const [metadata, content, classifications, duplicateGroups] = await Promise.all([
@@ -150,8 +151,8 @@ async function getFileDetail(fileId) {
   };
 }
 
-async function getDownloadStream(fileId) {
-  const file = await fileRepository.findById(fileId);
+async function getDownloadStream(fileId, ownerUserId) {
+  const file = await fileRepository.findByIdForOwner(fileId, ownerUserId);
   if (!file) throw new NotFoundError("File not found.");
   if (file.status !== "active") throw new NotFoundError("File is not currently active on disk.");
 
@@ -171,8 +172,8 @@ async function getDownloadStream(fileId) {
  * uploaded SVG or HTML-disguised-as-something-else can't execute anything,
  * because what comes back is always a flat raster image.
  */
-async function getPreviewImage(fileId) {
-  const file = await fileRepository.findById(fileId);
+async function getPreviewImage(fileId, ownerUserId) {
+  const file = await fileRepository.findByIdForOwner(fileId, ownerUserId);
   if (!file) throw new NotFoundError("File not found.");
   if (file.status !== "active") throw new NotFoundError("File is not currently active on disk.");
 
@@ -203,7 +204,7 @@ async function recordDownloadAudit(fileId, userId) {
  * generateNamesProcessor's rejected-match check).
  */
 async function removeFile(fileId, actorUserId) {
-  const file = await fileRepository.findById(fileId);
+  const file = await fileRepository.findByIdForOwner(fileId, actorUserId);
   if (!file) throw new NotFoundError("File not found.");
 
   await fileRepository.updateStatus(fileId, FileStatus.DELETED);
@@ -239,11 +240,18 @@ async function removeFile(fileId, actorUserId) {
  * the useful thing to know, without making a claim in the database that
  * nobody reviewed.
  */
-async function compareFiles(fileIdA, fileIdB) {
+async function compareFiles(fileIdA, fileIdB, ownerUserId) {
   if (!fileIdA || !fileIdB) throw new ValidationError("Two file ids are required.");
   if (fileIdA === fileIdB) throw new ValidationError("Pick two different files to compare.");
 
-  const [a, b] = await Promise.all([fileRepository.findById(fileIdA), fileRepository.findById(fileIdB)]);
+  // BOTH sides are owner-scoped. Comparing is read-only, but it reports word
+  // counts, hashes and a similarity score -- enough to confirm whether a
+  // stranger holds a document you already have, which is exactly the
+  // inference an isolated archive must not leak.
+  const [a, b] = await Promise.all([
+    fileRepository.findByIdForOwner(fileIdA, ownerUserId),
+    fileRepository.findByIdForOwner(fileIdB, ownerUserId),
+  ]);
   if (!a) throw new NotFoundError("The first file was not found.");
   if (!b) throw new NotFoundError("The second file was not found.");
 
@@ -338,11 +346,11 @@ async function removeAllFiles(actorUserId) {
   // Sized upfront so the Processing Jobs page can show real X/Y progress
   // instead of the "—" it shows when progress_total is left at 0 -- without
   // this a long-running bulk delete looks identical to a stuck one.
-  const totalActive = await fileRepository.countByStatus(FileStatus.ACTIVE);
+  const totalActive = await fileRepository.countByStatus(FileStatus.ACTIVE, actorUserId);
   const job = await enqueueJob(
     JobType.BULK_DELETE,
-    { actorUserId },
-    { createdBy: actorUserId, progressTotal: totalActive }
+    { actorUserId, ownerUserId: actorUserId },
+    { createdBy: actorUserId, ownerUserId: actorUserId, progressTotal: totalActive }
   );
 
   await auditLogRepository.record({
@@ -365,8 +373,8 @@ async function removeAllFiles(actorUserId) {
  * requires (document.rename for filename, classification.modify for
  * subject/documentType) before this is ever called.
  */
-async function updateFile(fileId, { filename, subjectId, documentTypeId }, actorUserId) {
-  const file = await fileRepository.findById(fileId);
+async function updateFile(fileId, { filename, subjectId, documentTypeId, confirmDuplicate }, actorUserId) {
+  const file = await fileRepository.findByIdForOwner(fileId, actorUserId);
   if (!file) throw new NotFoundError("File not found.");
   if (file.status !== "active") throw new ValidationError("Only active files can be edited.");
 
@@ -440,42 +448,78 @@ async function updateFile(fileId, { filename, subjectId, documentTypeId }, actor
   }
 
   if (subjectId !== undefined || documentTypeId !== undefined) {
-    if (subjectId) {
-      const subject = await subjectRepository.findById(subjectId);
-      if (!subject) throw new ValidationError("subjectId does not match a known subject.");
-    }
     if (documentTypeId) {
       const documentType = await documentTypeRepository.findById(documentTypeId);
       if (!documentType) throw new ValidationError("documentTypeId does not match a known document type.");
     }
 
-    // A manual classification becomes the new "latest" classification_results
-    // row (method: 'manual') -- everything that reads "the file's current
-    // subject" already goes off the most recent row (Subjects page,
-    // generateNamesProcessor's folder placement), so this correctly
-    // overrides whatever the rule-based/AI tiers had decided, same as a
-    // human correcting an AI's guess should.
-    await classificationResultRepository.create({
-      fileId,
-      classifiedSubjectId: subjectId || null,
-      classifiedDocumentTypeId: documentTypeId || null,
-      confidenceLevel: ConfidenceLevel.HIGH,
-      confidenceScore: 1.0,
-      method: ClassificationMethod.MANUAL,
-      rawOutput: { reason: "Manually set from the Files page" },
-    });
+    /**
+     * FILING GOES THROUGH THE ONE MOVE PATH.
+     *
+     * This used to write a classification_results row directly, and that was
+     * the hole in the duplicate invariant: PATCH /files/:id is what the Files
+     * page's Move modal, the Subjects page and every AI-proposed `move_file`
+     * action all call, so all three filed documents into the tree without ever
+     * running the duplicate check. The check existed and simply was not on the
+     * path anyone used.
+     *
+     * Routing through fileOrganizeService.moveToSubject means the guard, the
+     * ownership check on the destination folder, the placement provenance and
+     * the audit entry apply to every move, from every surface, by
+     * construction rather than by each caller remembering.
+     *
+     * `confirmDuplicate` is threaded through so the caller can come back and
+     * say "yes, file it anyway" -- the guard advises, it never traps.
+     */
+    if (subjectId) {
+      const outcome = await fileOrganizeService.moveToSubject({
+        fileId,
+        subjectId,
+        ownerUserId: actorUserId,
+        source: fileOrganizeService.PlacementSource.USER,
+        confirmDuplicate: Boolean(confirmDuplicate),
+      });
 
-    await auditLogRepository.record({
-      userId: actorUserId,
-      action: "file.reclassified",
-      entityType: "file",
-      entityId: fileId,
-      newState: { subjectId: subjectId || null, documentTypeId: documentTypeId || null },
-      reason: "Manually set from the Files page",
-    });
+      // Not moved means the guard wants a decision. Surfaced as structured
+      // data rather than an exception so the controller can answer 409 with
+      // the findings, and the UI can show what it found.
+      if (!outcome.moved) {
+        return {
+          requiresConfirmation: true,
+          findings: outcome.findings,
+          destination: outcome.destination,
+        };
+      }
+    }
+
+    // A document TYPE is orthogonal to a subject (docs/03-taxonomy.md §3.4)
+    // and carries no duplicate implications, so it is still written here --
+    // but only when it is the thing that actually changed, or the subject
+    // move above would be immediately overwritten by a second row naming no
+    // subject at all.
+    if (documentTypeId !== undefined && !subjectId) {
+      await classificationResultRepository.create({
+        fileId,
+        classifiedSubjectId: null,
+        classifiedDocumentTypeId: documentTypeId || null,
+        confidenceLevel: ConfidenceLevel.HIGH,
+        confidenceScore: 1.0,
+        method: ClassificationMethod.MANUAL,
+        rawOutput: { reason: "Document type manually set from the Files page" },
+      });
+
+      await auditLogRepository.record({
+        userId: actorUserId,
+        action: "file.reclassified",
+        entityType: "file",
+        entityId: fileId,
+        newState: { documentTypeId: documentTypeId || null },
+        reason: "Manually set from the Files page",
+      });
+    }
   }
 
-  return getFileDetail(fileId);
+  return getFileDetail(fileId, actorUserId);
 }
 
 /**
@@ -488,8 +532,8 @@ async function updateFile(fileId, { filename, subjectId, documentTypeId }, actor
  * so there's nothing on ITS disk to reveal (see docs/04-storage-architecture.md
  * §4.4 -- and AgentStorageService doesn't exist yet regardless, Phase 12).
  */
-async function revealInFileManager(fileId) {
-  const file = await fileRepository.findById(fileId);
+async function revealInFileManager(fileId, ownerUserId) {
+  const file = await fileRepository.findByIdForOwner(fileId, ownerUserId);
   if (!file) throw new NotFoundError("File not found.");
   if (file.status !== "active") throw new NotFoundError("File is not currently active on disk.");
 

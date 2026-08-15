@@ -3,23 +3,23 @@ const mime = require("../utils/mimeGuess");
 const { buildContentDisposition } = require("../utils/contentDisposition");
 
 async function list(req, res) {
-  res.json(await fileService.search(req.query));
+  res.json(await fileService.search(req.query, req.user.id));
 }
 
 async function count(req, res) {
-  res.json(await fileService.count(req.query));
+  res.json(await fileService.count(req.query, req.user.id));
 }
 
 async function filterOptions(req, res) {
-  res.json(await fileService.filterOptions());
+  res.json(await fileService.filterOptions(req.user.id));
 }
 
 async function getOne(req, res) {
-  res.json(await fileService.getFileDetail(req.params.id));
+  res.json(await fileService.getFileDetail(req.params.id, req.user.id));
 }
 
 async function download(req, res) {
-  const { file, stream } = await fileService.getDownloadStream(req.params.id);
+  const { file, stream } = await fileService.getDownloadStream(req.params.id, req.user.id);
   await fileService.recordDownloadAudit(file.id, req.user.id);
 
   res.setHeader("Content-Type", mime.guessMimeType(file.extension, file.mime_type_detected));
@@ -55,7 +55,7 @@ async function download(req, res) {
 }
 
 async function preview(req, res) {
-  const { file, contentType, buffer } = await fileService.getPreviewImage(req.params.id);
+  const { file, contentType, buffer } = await fileService.getPreviewImage(req.params.id, req.user.id);
 
   res.setHeader("Content-Type", contentType);
   // inline (not attachment) so the browser renders it -- always safe here
@@ -81,7 +81,7 @@ async function removeAll(req, res) {
 // what was asked, which would be confusing ("I set both fields but only
 // the name changed and I don't know why").
 async function update(req, res) {
-  const { filename, subjectId, documentTypeId } = req.body || {};
+  const { filename, subjectId, documentTypeId, confirmDuplicate } = req.body || {};
 
   if (filename !== undefined && !req.user.permissions.includes("document.rename")) {
     return res.status(403).json({ error: "Missing required permission: document.rename" });
@@ -90,16 +90,26 @@ async function update(req, res) {
     return res.status(403).json({ error: "Missing required permission: classification.modify" });
   }
 
-  res.json(await fileService.updateFile(req.params.id, { filename, subjectId, documentTypeId }, req.user.id));
+  const result = await fileService.updateFile(
+    req.params.id,
+    { filename, subjectId, documentTypeId, confirmDuplicate: Boolean(confirmDuplicate) },
+    req.user.id
+  );
+
+  // 409 when the duplicate guard found something worth interrupting for. Not
+  // an error to swallow: the body carries the findings and the actions
+  // available on each, and the UI walks the user through them before calling
+  // back with confirmDuplicate.
+  res.status(result?.requiresConfirmation ? 409 : 200).json(result);
 }
 
 async function reveal(req, res) {
-  res.json(await fileService.revealInFileManager(req.params.id));
+  res.json(await fileService.revealInFileManager(req.params.id, req.user.id));
 }
 
 async function compare(req, res) {
   const { fileIdA, fileIdB } = req.body || {};
-  res.json(await fileService.compareFiles(fileIdA, fileIdB));
+  res.json(await fileService.compareFiles(fileIdA, fileIdB, req.user.id));
 }
 
 module.exports = {

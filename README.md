@@ -9,7 +9,7 @@ Electron Filesystem Agent), plus several post-Phase-11 additions:
   rule-based classifier isn't confident and `GEMINI_API_KEY` is set, a Gemini pass
   produces a specific title, one-line summary and extracted entities. Entirely
   opt-in; unset the key and the pipeline behaves exactly as it did before.
-- **Email inbox triage** (`docs/10-email-inbox.md`) — connect Gmail/Outlook, auto-trash
+- **Email inbox triage** (`docs/10-email-inbox.md`) — connect Gmail, auto-trash
   clutter, surface the rest on a read-only Inbox page.
 - **Probable-duplicate and version detection** — content similarity short of a hash
   match, as reviewable suggestions that are never auto-applied.
@@ -30,7 +30,7 @@ docs/
   07-supported-formats.md     What's actually extractable per format, and why
   08-api-contracts.md         Resource/endpoint map, permission per route
   09-ai-classification.md     The optional Gemini escalation tier
-  10-email-inbox.md           Gmail/Outlook triage design
+  10-email-inbox.md           Gmail triage design
 
 backend/
   migrations/     17 numbered, forward-only SQL files
@@ -47,7 +47,7 @@ backend/
                     + AgentStorageService (brokered through a Filesystem Agent)
       extraction/   per-format extractors (pdf/xlsx/docx/pptx/pbix)
                     + ole/ for legacy .doc/.xls/.ppt
-      email/        Gmail + Outlook OAuth and API clients (raw fetch, no SDK)
+      email/        Gmail OAuth and API client (raw fetch, no SDK)
       ai/           geminiClassifier, geminiChatService, emailTriageClassifier
       preview/      LibreOffice-backed thumbnails
       similarityService.js  shingle/Jaccard engine for duplicates + versions

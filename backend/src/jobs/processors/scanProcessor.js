@@ -13,6 +13,31 @@ const { getStorageServiceFor } = require("../../services/storage/storageService"
 const { enqueueJob } = require("../../queues");
 const { JobType } = require("../../models/enums");
 
+/**
+ * Files the operating system writes for itself.
+ *
+ * Matched case-insensitively on the exact basename, not by prefix or
+ * extension: a real document called "Thumbs.db backup notes.docx" must not be
+ * swallowed, and neither must a user file that merely starts with a dot in a
+ * folder they chose deliberately.
+ */
+const SYSTEM_JUNK = new Set([
+  "desktop.ini",     // Windows folder view settings
+  "thumbs.db",       // Windows thumbnail cache
+  "ehthumbs.db",
+  ".ds_store",       // macOS Finder metadata
+  // macOS's custom-folder-icon file is deliberately NOT listed: its real
+  // name ends with a carriage return, and the bare "icon" needed
+  // to match it here would also swallow a legitimate document somebody
+  // called "Icon". Letting one macOS artefact through is the lesser harm;
+  // silently dropping a user file is not.
+  ".localized",
+]);
+
+function isSystemJunk(name) {
+  return SYSTEM_JUNK.has(String(name || "").trim().toLowerCase());
+}
+
 async function handle({ storageLocationId }) {
   const storageLocation = await storageLocationRepository.findById(storageLocationId);
   if (!storageLocation) throw new Error(`Storage location ${storageLocationId} not found`);
@@ -49,6 +74,16 @@ async function handle({ storageLocationId }) {
 
   try {
     for await (const entry of storageService.listDirectory()) {
+      // Operating-system bookkeeping is not a document.
+      //
+      // `desktop.ini` and `Thumbs.db` are written by Windows into folders the
+      // user never thinks about, and indexing them means they appear in the
+      // Files list, get hashed, get classified, and sit in triage as
+      // unnameable -- work spent on a file the user did not put there and
+      // cannot meaningfully file. Skipped at discovery so they never enter the
+      // corpus at all, rather than being filtered out of each view separately.
+      if (isSystemJunk(entry.name)) continue;
+
       counts.discovered += 1;
       const relativePath = path.relative(storageService.rootPath, entry.path);
       const existing = await fileRepository.findByLocationAndPath(storageLocationId, relativePath);

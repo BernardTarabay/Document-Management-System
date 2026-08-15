@@ -5,13 +5,17 @@ const path = require("path");
 const cloudPlaceholder = require("../../utils/cloudPlaceholder");
 const fileRepository = require("../../repositories/fileRepository");
 const fileHashRepository = require("../../repositories/fileHashRepository");
+const fileOcrRepository = require("../../repositories/fileOcrRepository");
 const storageLocationRepository = require("../../repositories/storageLocationRepository");
 const auditLogRepository = require("../../repositories/auditLogRepository");
 const { getStorageServiceFor } = require("../../services/storage/storageService");
 const knownContentService = require("../../services/knownContentService");
 const { sha256Stream } = require("../../services/hashingService");
 const { enqueueJob } = require("../../queues");
-const { JobType } = require("../../models/enums");
+const imageDetection = require("../../services/imageDetection");
+const pipelineState = require("../../services/pipelineState");
+const ocrEngine = require("../../services/ocr/ocrEngine");
+const { JobType, OcrStatus } = require("../../models/enums");
 
 async function handle({ fileId }) {
   const file = await fileRepository.findById(fileId);
@@ -77,7 +81,7 @@ async function handle({ fileId }) {
   // the genuinely new files go through the pipeline, instead of every file
   // being re-parsed and handed back for review as a duplicate of something
   // the user already dealt with.
-  const twin = await fileRepository.findProcessedTwinByHash(hash, fileId);
+  const twin = await fileRepository.findProcessedTwinByHash(hash, fileId, file.owner_user_id);
   if (twin) {
     const summary = await knownContentService.adoptFrom({ ...file, sha256_hash: hash }, twin);
 
@@ -87,14 +91,93 @@ async function handle({ fileId }) {
     // one fact worth surfacing about this file.
     await enqueueJob(JobType.DETECT_DUPLICATES, { fileId }, { storageLocationId: storageLocation.id });
 
+    // The adoption path skips the analysis stages, so it has to carry the
+    // routing decision itself -- otherwise a second copy of a photograph is
+    // adopted as a document and never appears in Photos.
+    if (imageDetection.isImage(file)) {
+      await fileRepository.setIsImage(fileId, true);
+      await fileRepository.setOcrStatus(fileId, OcrStatus.PENDING);
+    }
+
+    // Adoption replaces the analysis stages, so nothing downstream will ever
+    // set this file's state. It inherited a finished twin's results, so it is
+    // as finished as the twin -- leaving it at 'discovered' made an adopted
+    // file look permanently unprocessed.
+    await pipelineState.markCompleted(fileId, "hash");
+
     return { sha256Hash: hash, knownContent: true, ...summary };
   }
 
+  // ROUTING: a picture is not a document, and must not be treated as one.
+  //
+  // Everything below used to be unconditional, which is how a folder of
+  // photographs ended up in triage. extract_text on a JPEG finds nothing,
+  // textQuality judges the nothing unusable, generate_names correctly refuses
+  // to name a file from unusable text -- and the file lands in triage flagged
+  // "needs OCR" with no OCR to be had. Four stages of work to arrive at "this
+  // is a photo", which the extension said at ingest.
+  //
+  // So the route is decided once, here, from the extension and the detected
+  // mime, and the file goes down exactly one path.
+  const route = imageDetection.routeFor(file);
+
   await enqueueJob(JobType.EXTRACT_METADATA, { fileId }, { storageLocationId: storageLocation.id });
-  await enqueueJob(JobType.EXTRACT_TEXT, { fileId }, { storageLocationId: storageLocation.id });
   await enqueueJob(JobType.DETECT_DUPLICATES, { fileId }, { storageLocationId: storageLocation.id });
 
-  return { sha256Hash: hash };
+  if (route === "image") {
+    await fileRepository.setIsImage(fileId, true);
+
+    // Straight to Photos. If an OCR engine is present the text is read in the
+    // background; if not, the photo is still listed, viewable and filable --
+    // it simply has no text yet, which the Photos page states plainly rather
+    // than leaving the user to infer.
+    // Only queue OCR when there is OCR left to do.
+    //
+    // This used to stamp 'queued' unconditionally, which regressed the status
+    // of every already-read photo on each rescan -- and worse, it RACED.
+    // Hashing runs four wide, so a later hash job's 'queued' could land after
+    // an earlier OCR job's 'completed', leaving the photo permanently showing
+    // "Queued" while file_ocr said it had been read. Two columns describing
+    // one fact and disagreeing, which is the standing cost of the
+    // denormalisation and has to be paid at every write.
+    let ocrQueued = false;
+    const engine = await ocrEngine.detect();
+
+    if (!engine.available) {
+      // Nothing to claim -- record that it is waiting on an engine, and only
+      // if it has not already been read by one that was present earlier.
+      await fileRepository.claimForOcr(fileId);
+      await fileRepository.setOcrStatus(fileId, OcrStatus.PENDING);
+    } else if (await fileRepository.claimForOcr(fileId)) {
+      // We won the claim, so we own the follow-up job. A file already
+      // 'completed' or 'running' yields nothing here and is left alone --
+      // which is what stops a rescan resetting photos that were already read.
+      await enqueueJob(JobType.OCR, { fileId }, { storageLocationId: storageLocation.id });
+      ocrQueued = true;
+    }
+
+    // NEEDS_USER, not COMPLETED: a photograph nobody has looked at is exactly
+    // the thing waiting on a person. It shows in Photos as unreviewed, and
+    // filing it or keeping its name clears it. It is deliberately NOT in the
+    // triage queue -- triageRepository excludes images (see its WHERE clause).
+    await pipelineState.markNeedsUser(fileId, "hash", "A photo -- have a look and file it.");
+
+    return { sha256Hash: hash, route, ocrQueued };
+  }
+
+  if (route === "media") {
+    // Audio/video: indexed and filable, but there is no text in it and none
+    // will be invented. Saying so is more useful than four failed stages.
+    await pipelineState.markNeedsUser(
+      fileId, "hash",
+      "Audio or video -- there is no text to extract, so Atlas cannot name or classify it. File it yourself."
+    );
+    return { sha256Hash: hash, route };
+  }
+
+  await enqueueJob(JobType.EXTRACT_TEXT, { fileId }, { storageLocationId: storageLocation.id });
+
+  return { sha256Hash: hash, route };
 }
 
 module.exports = { handle };

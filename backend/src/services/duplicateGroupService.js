@@ -2,6 +2,7 @@ const duplicateGroupRepository = require("../repositories/duplicateGroupReposito
 const auditLogRepository = require("../repositories/auditLogRepository");
 const { enqueueJob } = require("../queues");
 const { parsePagination } = require("../utils/pagination");
+const { requireOwner } = require("../repositories/ownership");
 const { ValidationError } = require("../validators/validationError");
 const { JobType, DuplicateGroupType } = require("../models/enums");
 
@@ -13,14 +14,17 @@ class NotFoundError extends Error {
   }
 }
 
-async function search(query) {
+async function search(query, ownerUserId) {
+  requireOwner(ownerUserId, "duplicateGroupService.search");
   const { limit, offset } = parsePagination(query);
-  if (!query.status || query.status === "open") return duplicateGroupRepository.listOpen({ limit, offset });
-  return duplicateGroupRepository.list({ limit, offset });
+  if (!query.status || query.status === "open") {
+    return duplicateGroupRepository.listOpen(ownerUserId, { limit, offset });
+  }
+  return duplicateGroupRepository.listForOwner(ownerUserId, { limit, offset });
 }
 
-async function getById(id) {
-  const group = await duplicateGroupRepository.findById(id);
+async function getById(id, ownerUserId) {
+  const group = await duplicateGroupRepository.findByIdForOwner(id, ownerUserId);
   if (!group) throw new NotFoundError("Duplicate group not found.");
   const members = await duplicateGroupRepository.listMembers(id);
   return {
@@ -43,7 +47,9 @@ async function getById(id) {
  */
 async function resolve(id, { canonicalFileId }, actorUserId) {
   if (!canonicalFileId) throw new ValidationError("canonicalFileId is required.");
-  const group = await duplicateGroupRepository.findById(id);
+  // Owner-scoped: resolving picks which copy of a document is authoritative,
+  // which is not a decision anyone may make about somebody else's archive.
+  const group = await duplicateGroupRepository.findByIdForOwner(id, actorUserId);
   if (!group) throw new NotFoundError("Duplicate group not found.");
 
   const members = await duplicateGroupRepository.listMembers(id);
@@ -106,7 +112,7 @@ function pickCanonicalMember(members) {
  * processor can treat that as "nothing to do" rather than a failure.
  */
 async function autoResolveGroup(groupId, actorUserId) {
-  const group = await duplicateGroupRepository.findById(groupId);
+  const group = await duplicateGroupRepository.findByIdForOwner(groupId, actorUserId);
   if (!group || group.status !== "open") return null;
 
   // Defense in depth alongside the 'exact' filter the job passes to
@@ -143,11 +149,11 @@ async function autoResolveGroup(groupId, actorUserId) {
 async function enqueueAutoResolveAll(actorUserId) {
   // Only EXACT groups are auto-resolvable, so the progress total must count
   // only those -- otherwise the job reports a total it will never reach.
-  const total = await duplicateGroupRepository.countOpen(DuplicateGroupType.EXACT);
+  const total = await duplicateGroupRepository.countOpen(actorUserId, DuplicateGroupType.EXACT);
   const job = await enqueueJob(
     JobType.AUTO_RESOLVE_DUPLICATES,
-    { actorUserId },
-    { createdBy: actorUserId, progressTotal: total }
+    { actorUserId, ownerUserId: actorUserId },
+    { createdBy: actorUserId, ownerUserId: actorUserId, progressTotal: total }
   );
 
   await auditLogRepository.record({

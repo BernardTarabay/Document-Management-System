@@ -1,10 +1,30 @@
 // Physical File persistence. See docs/01-domain-model.md for File vs Document.
+//
+// TWO CLASSES OF READ LIVE IN HERE
+//
+// Functions taking an `ownerUserId` answer HTTP requests and are scoped to
+// that owner in SQL. Functions that do not take one are worker-side and are
+// reached only via a storage location whose owner was already established --
+// `findByLocationAndPath` is the clearest example: the location id IS the
+// authorization, because a location belongs to exactly one account.
+//
+// The dangerous middle ground is content-addressed lookup. `findBySha256` and
+// friends match on a hash, which knows nothing about who owns the bytes, so
+// they crossed account boundaries by construction: two users holding the same
+// PDF would have been put in one duplicate group, and one could adopt the
+// other's classification, AI summary and canonical name. Those all take an
+// owner now, and it is a required argument rather than an optional filter.
 const db = require("../config/database");
 const { createBaseRepository } = require("./baseRepository");
 const { tsQueryExpression } = require("./fileContentRepository");
 const { buildFilterSql } = require("./fileFilters");
+const { requireOwner, ownedRepository } = require("./ownership");
 
 const base = createBaseRepository("files");
+// `findByIdForOwner` from here is what every request handler uses. The
+// unscoped `findById` above it stays for worker code, which reaches a file
+// through a storage location whose owner is already settled.
+const owned = ownedRepository(db, "files", { orderBy: "imported_at DESC" });
 
 async function findByLocationAndPath(storageLocationId, currentPath) {
   const { rows } = await db.query(
@@ -14,8 +34,21 @@ async function findByLocationAndPath(storageLocationId, currentPath) {
   return rows[0] || null;
 }
 
-async function findBySha256(sha256Hash) {
-  const { rows } = await db.query("SELECT * FROM files WHERE sha256_hash = $1", [sha256Hash]);
+/**
+ * Files with these exact bytes, WITHIN one account.
+ *
+ * The owner is not a filter that narrows a result -- it is what makes the
+ * result meaningful. Identical bytes in two different people's archives are
+ * two unrelated documents that happen to be the same file; treating them as
+ * one is how a duplicate group ends up spanning accounts and offering to
+ * "resolve" by keeping a copy the other user cannot see.
+ */
+async function findBySha256(sha256Hash, ownerUserId) {
+  requireOwner(ownerUserId, "findBySha256");
+  const { rows } = await db.query(
+    "SELECT * FROM files WHERE sha256_hash = $1 AND owner_user_id = $2",
+    [sha256Hash, ownerUserId]
+  );
   return rows;
 }
 
@@ -131,7 +164,8 @@ async function setCanonicalName(id, { canonicalFilename, canonicalRelativeDir = 
  * Naming and filing are separate decisions and failing at one is no reason to
  * lose the other. Files with neither are genuinely unplaceable and stay out.
  */
-async function listForMirror({ limit = 1000, offset = 0 } = {}) {
+async function listForMirror(ownerUserId, { limit = 1000, offset = 0 } = {}) {
+  requireOwner(ownerUserId, "listForMirror");
   const { rows } = await db.query(
     `SELECT f.*,
             l.root_path, l.name AS location_name, l.is_read_only,
@@ -148,10 +182,11 @@ async function listForMirror({ limit = 1000, offset = 0 } = {}) {
           ORDER BY cr.created_at DESC LIMIT 1
        ) cls ON true
       WHERE f.status = 'active'
+        AND f.owner_user_id = $3
         AND (f.canonical_filename IS NOT NULL OR cls.subject_path IS NOT NULL)
       ORDER BY f.id
       LIMIT $1 OFFSET $2`,
-    [limit, offset]
+    [limit, offset, ownerUserId]
   );
   return rows;
 }
@@ -183,6 +218,96 @@ async function updateHash(id, sha256Hash) {
 
 async function updateMimeDetected(id, mimeTypeDetected) {
   await db.query("UPDATE files SET mime_type_detected = $2 WHERE id = $1", [id, mimeTypeDetected]);
+}
+
+/** Denormalised onto `files` so the Photos workspace, the triage counts and
+ *  the dashboard all read the same answer from one column rather than each
+ *  joining file_ocr and reaching a slightly different one. */
+async function setOcrStatus(id, ocrStatus) {
+  const { rows } = await db.query(
+    "UPDATE files SET ocr_status = $2 WHERE id = $1 RETURNING id, ocr_status",
+    [id, ocrStatus]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Claim a file for OCR, atomically.
+ *
+ * Returns the row only if this call is the one that moved it to 'queued'.
+ *
+ * WHY THIS IS NOT read-then-setOcrStatus
+ *
+ * That is what it was, and it raced. Hashing runs four wide, so between
+ * "read: not completed yet" and "write: queued" another worker's OCR job
+ * could finish and write 'completed' -- which this write then stamped back to
+ * 'queued'. The photo showed "Queued" forever on the Photos page while
+ * file_ocr said it had been read. Narrowing the window does not close it; only
+ * doing the test and the write in one statement does.
+ *
+ * 'completed' and 'running' are the states worth protecting: the first is a
+ * finished result, the second is a job actively holding the file. A forced
+ * re-run bypasses this by calling setOcrStatus directly, which is the correct
+ * escape hatch because forcing is an explicit human decision.
+ */
+async function claimForOcr(id) {
+  const { rows } = await db.query(
+    `UPDATE files SET ocr_status = 'queued'
+      WHERE id = $1 AND ocr_status NOT IN ('completed', 'running')
+      RETURNING id`,
+    [id]
+  );
+  return rows[0] || null;
+}
+
+/** Marks a file as a picture, decided once at ingestion by mime/extension. */
+async function setIsImage(id, isImage) {
+  await db.query("UPDATE files SET is_image = $2 WHERE id = $1", [id, Boolean(isImage)]);
+}
+
+/**
+ * The Photos workspace: pictures and anything else awaiting OCR.
+ *
+ * Deliberately NOT the ordinary file listing with a filter bolted on. A
+ * photograph is judged by looking at it, so this returns what a visual grid
+ * needs -- the OCR verdict, its confidence, and where the file is filed -- and
+ * orders unreviewed items first, because the point of the page is to work
+ * through the ones nobody has looked at yet.
+ */
+async function listPhotos(ownerUserId, { status = null, limit = 60, offset = 0 } = {}) {
+  requireOwner(ownerUserId, "listPhotos");
+  const { rows } = await db.query(
+    `SELECT f.*, ${FILE_DECORATION_COLUMNS},
+            o.status::text AS ocr_result_status,
+            o.confidence   AS ocr_confidence,
+            o.page_count   AS ocr_page_count,
+            o.error_message AS ocr_error,
+            length(o.text)  AS ocr_text_length
+       FROM files f
+       ${FILE_DECORATION}
+       LEFT JOIN file_ocr o ON o.file_id = f.id
+      WHERE f.owner_user_id = $1
+        AND f.status = 'active'
+        AND (f.is_image = true OR f.ocr_status <> 'not_needed')
+        AND ($4::text IS NULL OR f.ocr_status::text = $4)
+      ORDER BY (f.user_resolved_at IS NULL) DESC, f.imported_at DESC
+      LIMIT $2 OFFSET $3`,
+    [ownerUserId, limit, offset, status]
+  );
+  return rows;
+}
+
+async function countPhotos(ownerUserId, { status = null } = {}) {
+  requireOwner(ownerUserId, "countPhotos");
+  const { rows } = await db.query(
+    `SELECT count(*)::int AS count FROM files f
+      WHERE f.owner_user_id = $1
+        AND f.status = 'active'
+        AND (f.is_image = true OR f.ocr_status <> 'not_needed')
+        AND ($2::text IS NULL OR f.ocr_status::text = $2)`,
+    [ownerUserId, status]
+  );
+  return rows[0].count;
 }
 
 /**
@@ -263,9 +388,21 @@ async function updateAiEnrichment(id, { shortTitle, summary, entities }) {
  * named carries more to inherit than one that has only been extracted, and
  * the earliest import breaks ties so the choice is stable across runs rather
  * than depending on which row the planner happened to return first.
+ *
+ * WHY THE OWNER IS REQUIRED HERE
+ *
+ * Adoption copies extracted text, metadata, document date, classification and
+ * the AI summary from the twin. Without an owner scope, the twin could be
+ * another account's file -- so registering a folder containing a common
+ * document (a bank's standard terms, a government form) would silently import
+ * a stranger's AI-generated summary of it, their subject placement, and the
+ * document date they had corrected by hand. Nothing in the UI would say where
+ * any of it came from. Same bytes is not same document once there is more
+ * than one archive.
  */
-async function findProcessedTwinByHash(sha256Hash, excludeFileId) {
+async function findProcessedTwinByHash(sha256Hash, excludeFileId, ownerUserId) {
   if (!sha256Hash) return null;
+  requireOwner(ownerUserId, "findProcessedTwinByHash");
   const { rows } = await db.query(
     `SELECT f.*
        FROM files f
@@ -281,6 +418,7 @@ async function findProcessedTwinByHash(sha256Hash, excludeFileId) {
        ) latest ON true
       WHERE f.sha256_hash = $1
         AND f.id <> $2
+        AND f.owner_user_id = $3
         AND f.status <> 'deleted'
         AND f.is_cloud_placeholder IS NOT TRUE
         AND fc.extraction_status <> 'failed'
@@ -290,7 +428,7 @@ async function findProcessedTwinByHash(sha256Hash, excludeFileId) {
                (f.ai_classified_at IS NOT NULL) DESC,
                f.imported_at ASC
       LIMIT 1`,
-    [sha256Hash, excludeFileId]
+    [sha256Hash, excludeFileId, ownerUserId]
   );
   return rows[0] || null;
 }
@@ -299,13 +437,20 @@ async function findProcessedTwinByHash(sha256Hash, excludeFileId) {
  * Duplicate-cost-skip: find a sibling file (same content hash, already
  * AI-classified) so the LLM classifier never has to run twice against
  * identical content. Excludes the file itself.
+ *
+ * Owner-scoped for the same reason as findProcessedTwinByHash: the point of
+ * this lookup is to reuse a Gemini result, and a Gemini result is a
+ * description of a document written into someone's archive. Saving a fraction
+ * of a cent is not a reason to copy it across an account boundary.
  */
-async function findClassifiedSiblingByHash(sha256Hash, excludeFileId) {
+async function findClassifiedSiblingByHash(sha256Hash, excludeFileId, ownerUserId) {
+  requireOwner(ownerUserId, "findClassifiedSiblingByHash");
   const { rows } = await db.query(
     `SELECT * FROM files
-     WHERE sha256_hash = $1 AND id != $2 AND ai_classified_at IS NOT NULL
+     WHERE sha256_hash = $1 AND id != $2 AND owner_user_id = $3
+       AND ai_classified_at IS NOT NULL
      ORDER BY ai_classified_at DESC LIMIT 1`,
-    [sha256Hash, excludeFileId]
+    [sha256Hash, excludeFileId, ownerUserId]
   );
   return rows[0] || null;
 }
@@ -407,7 +552,8 @@ async function listUnprocessed(storageLocationId, before) {
  * One query for every location; the Storage Locations page renders a card
  * per location and must not issue a count per card.
  */
-async function countBacklogByLocation() {
+async function countBacklogByLocation(ownerUserId) {
+  requireOwner(ownerUserId, "countBacklogByLocation");
   const { rows } = await db.query(
     `SELECT f.storage_location_id,
             count(*) FILTER (WHERE j.file_id IS NOT NULL)::int AS in_flight,
@@ -420,9 +566,11 @@ async function countBacklogByLocation() {
              LIMIT 1
        ) j ON true
       WHERE f.status = 'active'
+        AND f.owner_user_id = $1
         AND (f.sha256_hash IS NULL
              OR NOT EXISTS (SELECT 1 FROM file_content fc WHERE fc.file_id = f.id))
-      GROUP BY f.storage_location_id`
+      GROUP BY f.storage_location_id`,
+    [ownerUserId]
   );
   return Object.fromEntries(
     rows.map((r) => [r.storage_location_id, { inFlight: r.in_flight, stalled: r.stalled }])
@@ -446,12 +594,19 @@ async function countBacklogByLocation() {
  * see the note in detectDuplicatesProcessor.
  */
 async function listSimilarityCandidates(file, { limit = 300 } = {}) {
+  // The candidate pool is drawn from the file's OWN owner, taken off the file
+  // row rather than passed in -- a similarity comparison against a document
+  // the user cannot open would produce a duplicate group whose other half is
+  // invisible to them, and an "existing similar document" warning naming a
+  // file that does not exist as far as they are concerned.
+  const ownerUserId = requireOwner(file.owner_user_id, "listSimilarityCandidates");
   const { rows } = await db.query(
     `SELECT f.id, f.filename_current, f.filename_original, f.current_path,
             f.size_bytes, f.extension, f.sha256_hash, fc.extracted_text
      FROM files f
      JOIN file_content fc ON fc.file_id = f.id
      WHERE f.id != $1
+       AND f.owner_user_id = $5
        AND f.status = 'active'
        AND f.extension IS NOT DISTINCT FROM $2
        AND (f.sha256_hash IS NULL OR f.sha256_hash IS DISTINCT FROM $3)
@@ -459,7 +614,7 @@ async function listSimilarityCandidates(file, { limit = 300 } = {}) {
        AND length(fc.extracted_text) > 0
      ORDER BY f.imported_at DESC
      LIMIT $4`,
-    [file.id, file.extension, file.sha256_hash, limit]
+    [file.id, file.extension, file.sha256_hash, limit, ownerUserId]
   );
   return rows;
 }
@@ -562,13 +717,15 @@ async function searchEverything(query, { limit = 50, offset = 0, subjectId = nul
   return rows;
 }
 
-async function searchByFilename(fragment, { limit = 50, offset = 0 } = {}) {
+async function searchByFilename(fragment, ownerUserId, { limit = 50, offset = 0 } = {}) {
+  requireOwner(ownerUserId, "searchByFilename");
   const { rows } = await db.query(
     `SELECT * FROM files
      WHERE (filename_original ILIKE '%' || $1 || '%' OR filename_current ILIKE '%' || $1 || '%')
+       AND owner_user_id = $4
        AND status != 'deleted'
      ORDER BY imported_at DESC LIMIT $2 OFFSET $3`,
-    [fragment, limit, offset]
+    [fragment, limit, offset, ownerUserId]
   );
   return rows;
 }
@@ -692,39 +849,53 @@ async function countMatching({ filters = null, includeDeleted = false } = {}) {
  * of the repository each type represents -- the same argument
  * dashboardRepository.byExtension makes.
  */
-async function filterFacets() {
+async function filterFacets(ownerUserId) {
+  requireOwner(ownerUserId, "filterFacets");
   const [extensions, dates] = await Promise.all([
     db.query(
       `SELECT coalesce(nullif(lower(f.extension), ''), 'none') AS ext,
               count(*)::int AS count
          FROM files f
-        WHERE f.status != 'deleted'
+        WHERE f.status != 'deleted' AND f.owner_user_id = $1
         GROUP BY 1
-        ORDER BY count DESC, ext`
+        ORDER BY count DESC, ext`,
+      [ownerUserId]
     ),
     db.query(
       `SELECT min(document_date) AS earliest, max(document_date) AS latest,
               count(*) FILTER (WHERE document_date IS NULL)::int AS undated
-         FROM files WHERE status != 'deleted'`
+         FROM files WHERE status != 'deleted' AND owner_user_id = $1`,
+      [ownerUserId]
     ),
   ]);
   return { extensions: extensions.rows, dateRange: dates.rows[0] };
 }
 
-async function listByStatus(status, { limit = 100, offset = 0, excludeIds = null } = {}) {
+// Both of these back "remove ALL files" (fileService.removeAll and
+// bulkDeleteProcessor). An unscoped `status = 'active'` there would have
+// enumerated -- and then queued for deletion -- every account's files from one
+// user's button press. That is the single most destructive unscoped query in
+// the codebase, which is why the owner is a positional argument rather than an
+// option with a default.
+async function listByStatus(status, ownerUserId, { limit = 100, offset = 0, excludeIds = null } = {}) {
+  requireOwner(ownerUserId, "listByStatus");
   const { rows } = await db.query(
     `SELECT * FROM files
-     WHERE status = $1 AND ($4::uuid[] IS NULL OR id <> ALL($4))
+     WHERE status = $1 AND owner_user_id = $5 AND ($4::uuid[] IS NULL OR id <> ALL($4))
      ORDER BY imported_at DESC LIMIT $2 OFFSET $3`,
-    [status, limit, offset, excludeIds && excludeIds.length ? excludeIds : null]
+    [status, limit, offset, excludeIds && excludeIds.length ? excludeIds : null, ownerUserId]
   );
   return rows;
 }
 
 /** Cheap count for progress totals (e.g. "remove all files" job sizing) --
  * avoids pulling every row across the wire just to know how many there are. */
-async function countByStatus(status) {
-  const { rows } = await db.query("SELECT COUNT(*)::int AS count FROM files WHERE status = $1", [status]);
+async function countByStatus(status, ownerUserId) {
+  requireOwner(ownerUserId, "countByStatus");
+  const { rows } = await db.query(
+    "SELECT COUNT(*)::int AS count FROM files WHERE status = $1 AND owner_user_id = $2",
+    [status, ownerUserId]
+  );
   return rows[0].count;
 }
 
@@ -782,7 +953,8 @@ async function listBySubject(subjectId, { limit = 50, offset = 0, filters = null
  * an already-resolved duplicate group) but returns just the count -- used
  * to decide whether a subject can be deleted without pulling every row.
  */
-async function countBySubject(subjectId) {
+async function countBySubject(subjectId, ownerUserId) {
+  requireOwner(ownerUserId, "countBySubject");
   const { rows } = await db.query(
     `SELECT COUNT(*)::int AS count
      FROM files f
@@ -797,8 +969,9 @@ async function countBySubject(subjectId) {
          WHERE dgm.file_id = f.id
            AND dg.canonical_file_id IS NOT NULL
            AND dg.canonical_file_id != f.id
-       )`,
-    [subjectId]
+       )
+       AND f.owner_user_id = $2`,
+    [subjectId, ownerUserId]
   );
   return rows[0].count;
 }
@@ -839,8 +1012,38 @@ async function countsBySubject({ filters = null } = {}) {
   return Object.fromEntries(rows.map((r) => [r.subject_id, r.count]));
 }
 
+/**
+ * Several files by id, keeping only the caller's own.
+ *
+ * The bulk operations all need this. Doing it as one query rather than a loop
+ * of findByIdForOwner is not only faster -- it makes "silently drop the ones
+ * that are not yours" impossible to express by accident, because the caller
+ * gets back a list it must compare against what it asked for. bulkService
+ * does exactly that and reports the difference rather than pretending the
+ * whole batch succeeded.
+ */
+async function listByIdsForOwner(ids, ownerUserId) {
+  requireOwner(ownerUserId, "listByIdsForOwner");
+  if (!Array.isArray(ids) || ids.length === 0) return [];
+  const { rows } = await db.query(
+    `SELECT f.*, ${FILE_DECORATION_COLUMNS}
+       FROM files f
+       ${FILE_DECORATION}
+      WHERE f.id = ANY($1::uuid[]) AND f.owner_user_id = $2`,
+    [ids, ownerUserId]
+  );
+  return rows;
+}
+
 module.exports = {
   ...base,
+  ...owned,
+  listByIdsForOwner,
+  setOcrStatus,
+  claimForOcr,
+  setIsImage,
+  listPhotos,
+  countPhotos,
   countsBySubject,
   findByLocationAndPath,
   findBySha256,

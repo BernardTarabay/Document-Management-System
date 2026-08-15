@@ -7,6 +7,25 @@ const SIGNATURES = [
   { family: "pdf", bytes: [0x25, 0x50, 0x44, 0x46] },              // %PDF
   { family: "ole-cfb", bytes: [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1] }, // legacy .doc/.xls/.ppt
   { family: "zip", bytes: [0x50, 0x4b, 0x03, 0x04] },              // PK\x03\x04 (OOXML + pbix)
+
+  // IMAGES.
+  //
+  // These were missing entirely, and the consequence was not cosmetic: with no
+  // signature match a JPEG fell through to the extension fallback at the
+  // bottom and was typed `unknown/jpeg`. thumbnailService tests the mime
+  // against a list of real image types, `unknown/jpeg` is not on it, so every
+  // photograph was routed to the LibreOffice rasteriser -- which is for
+  // turning documents into pictures, is not installed here, and cannot render
+  // a JPEG anyway. Result: "No preview available" on every single photo, on a
+  // page whose entire purpose is looking at them.
+  //
+  // Each of these is the standard magic number for its format.
+  { family: "image", subtype: "jpeg", bytes: [0xff, 0xd8, 0xff] },
+  { family: "image", subtype: "png", bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
+  { family: "image", subtype: "gif", bytes: [0x47, 0x49, 0x46, 0x38] },          // GIF8
+  { family: "image", subtype: "bmp", bytes: [0x42, 0x4d] },                      // BM
+  { family: "image", subtype: "tiff", bytes: [0x49, 0x49, 0x2a, 0x00] },         // little-endian
+  { family: "image", subtype: "tiff", bytes: [0x4d, 0x4d, 0x00, 0x2a] },         // big-endian
 ];
 
 function matchesSignature(buffer, sig) {
@@ -62,7 +81,10 @@ function detectSignature(buffer, extensionHint = "") {
       if (sig.family === "zip") {
         return disambiguateZipFamily(buffer);
       }
-      return { family: sig.family, subtype: sig.family };
+      // `subtype` when the entry declares one (the image formats all share
+      // family "image" and differ only by subtype); otherwise it mirrors the
+      // family, as it always did.
+      return { family: sig.family, subtype: sig.subtype || sig.family };
     }
   }
 

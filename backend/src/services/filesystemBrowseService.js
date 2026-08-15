@@ -1,14 +1,30 @@
 // Server-side folder picker for registering a storage location.
 //
 // Hand-typing an absolute path is error-prone (normalizeRootPath() exists
-// purely to patch around Windows "Copy as path" quoting), so this lets an
-// admin click through the backend's own filesystem instead.
+// purely to patch around Windows "Copy as path" quoting), so this lets a user
+// click through the backend's own filesystem instead.
 //
-// Deliberately not sandboxed to a fixed root: this route is gated behind the
-// same "user.manage" permission as creating a storage location, and the
-// backend can only ever see what it can see -- registering that same path
-// would grant identical access. It returns directory NAMES only, never file
-// contents.
+// WHY THIS IS CONFINABLE RATHER THAN PERMISSION-GATED
+//
+// The original note here said an unsandboxed picker was fine "because this
+// route is gated behind the same user.manage permission as creating a storage
+// location". That stopped being true: registering a location moved to
+// `storage.manage`, because pointing the app at your own folder is not an act
+// of user administration -- and leaving the picker on `user.manage` left the
+// primary "Add storage location" button 403ing for exactly the accounts that
+// had just been given permission to add one.
+//
+// A permission was never the right control anyway. On a machine serving two
+// accounts the risk is that one enumerates the other's home directory, and no
+// per-user scope can narrow a bare directory listing -- there is nothing on it
+// to scope BY. Containment can. So browsing is confinable to an explicit set
+// of roots via BROWSE_ROOTS.
+//
+// The DEFAULT is unconfined, which is a deliberate reversal -- see browseRoots
+// below for why, and warnIfSharedAndUnconfined for how the risk is surfaced
+// when it actually arises.
+//
+// It returns directory NAMES only, never file contents.
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
@@ -16,6 +32,104 @@ const os = require("os");
 const { ValidationError } = require("../validators/validationError");
 
 const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * Where browsing is allowed to reach.
+ *
+ * THE DEFAULT IS UNCONFINED, AND THAT IS A REVERSAL
+ *
+ * This first shipped defaulting to the backend account's home directory, on
+ * the reasoning that a shared server must not let one account enumerate
+ * another's files. The reasoning is still right; the default was still wrong,
+ * and measurably so -- on a normal Windows install it filtered out every
+ * drive including C:\, so the picker offered no drives at all and a folder on
+ * D:\ was unreachable. Defending against a second account that does not exist,
+ * by breaking the primary function of the application for the account that
+ * does, is the wrong trade.
+ *
+ * This app's actual deployment is self-hosted on the user's own desktop --
+ * `fileService.revealInFileManager` spawns the host OS file manager and says
+ * so outright. On that machine the backend's filesystem IS the user's
+ * filesystem, and a picker that cannot see their external drive is a picker
+ * that does not work.
+ *
+ * So: open by default, confinable by configuration, and the risk is surfaced
+ * at boot exactly when it becomes real -- see warnIfSharedAndUnconfined,
+ * which fires only once a second account exists.
+ *
+ *   BROWSE_ROOTS unset      no confinement (the desktop case)
+ *   BROWSE_ROOTS=*          the same, stated explicitly
+ *   BROWSE_ROOTS=C:\;E:\    exactly these (the shared-server case)
+ *
+ * @returns {string[]|null} null means no confinement
+ */
+function browseRoots() {
+  const configured = (process.env.BROWSE_ROOTS || "").trim();
+  if (!configured || configured === "*") return null;
+
+  return configured
+    .split(path.delimiter)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => path.resolve(p));
+}
+
+/**
+ * Say something at boot if this install has grown a second account while the
+ * picker is still unconfined.
+ *
+ * The point of a default is that nobody reads it. A single-user desktop should
+ * not have to configure anything; a shared install should not silently expose
+ * one user's home directory to another. Checking at startup catches the moment
+ * the assumption stops holding, which is the only moment it matters -- and it
+ * warns rather than clamping down, because silently narrowing the picker after
+ * someone registers a second account would break the first account's setup for
+ * reasons they could not possibly connect.
+ */
+async function warnIfSharedAndUnconfined() {
+  if (browseRoots() !== null) return;   // already confined
+  try {
+    // Lazy require: this module is otherwise database-free and unit-testable.
+    const db = require("../config/database");
+    const { rows } = await db.query("SELECT count(*)::int AS n FROM users");
+    if (rows[0].n <= 1) return;
+
+    console.warn(
+      `[browse] ${rows[0].n} accounts exist and BROWSE_ROOTS is unset, so the folder picker can ` +
+      "enumerate this machine's entire filesystem for any of them -- including the other accounts' " +
+      "home directories. On a shared install, set BROWSE_ROOTS to the folders that should be " +
+      `reachable, e.g. BROWSE_ROOTS=${path.resolve(os.homedir())}`
+    );
+  } catch {
+    // A database that is not up yet is the server's problem to report, not
+    // this warning's.
+  }
+}
+
+/**
+ * Is `target` inside one of the allowed roots?
+ *
+ * Compared on the RESOLVED path, so `..` cannot climb out: resolve() collapses
+ * the traversal before this ever sees it. The separator suffix on the root is
+ * what stops `C:\Usersomething` matching a root of `C:\Users` -- a prefix test
+ * without it is the classic way this check is defeated.
+ *
+ * Case-insensitive on Windows, where `c:\users\me` and `C:\Users\Me` are the
+ * same directory and a case-sensitive compare would reject half the paths the
+ * picker itself produces.
+ */
+function isWithinRoots(target, roots) {
+  if (roots === null) return true;
+  const normalize = (p) => (IS_WINDOWS ? p.toLowerCase() : p);
+  const resolved = normalize(path.resolve(target));
+
+  return roots.some((root) => {
+    const normalizedRoot = normalize(root);
+    if (resolved === normalizedRoot) return true;
+    const withSep = normalizedRoot.endsWith(path.sep) ? normalizedRoot : normalizedRoot + path.sep;
+    return resolved.startsWith(withSep);
+  });
+}
 
 /**
  * Where a user's Desktop actually is.
@@ -42,15 +156,18 @@ function resolveKnownFolder(name) {
   }) || null;
 }
 
-/** Drive roots (Windows) or common mount points (POSIX) that exist. */
-function listDrives() {
+/** Drive roots (Windows) or common mount points (POSIX) that exist AND are browsable. */
+function listDrives(roots = browseRoots()) {
   const drives = [];
+  const keep = (entry) => isWithinRoots(entry.path, roots);
+
   if (IS_WINDOWS) {
     for (let code = 65; code <= 90; code += 1) {
       const root = `${String.fromCharCode(code)}:\\`;
       try {
         fs.accessSync(root);
-        drives.push({ name: root, path: root });
+        const entry = { name: root, path: root };
+        if (keep(entry)) drives.push(entry);
       } catch {
         // Drive letter not mounted -- an unplugged external is normal.
       }
@@ -60,7 +177,10 @@ function listDrives() {
 
   for (const root of ["/", "/Volumes", "/mnt", "/media"]) {
     try {
-      if (fs.statSync(root).isDirectory()) drives.push({ name: root, path: root });
+      if (fs.statSync(root).isDirectory()) {
+        const entry = { name: root, path: root };
+        if (keep(entry)) drives.push(entry);
+      }
     } catch { /* not present */ }
   }
   return drives;
@@ -69,11 +189,16 @@ function listDrives() {
 /**
  * The shortcuts shown down the side of the picker. These are the places
  * documents actually live; everything else is reachable by clicking.
+ *
+ * Filtered to what is reachable, so the picker never offers a shortcut that
+ * answers "outside the folders this server allows" when clicked.
  */
-function quickAccess() {
+function quickAccess(roots = browseRoots()) {
   const entries = [];
   const add = (label, target) => {
-    if (target && !entries.some((e) => e.path === target)) entries.push({ label, path: target });
+    if (!target) return;
+    if (!isWithinRoots(target, roots)) return;
+    if (!entries.some((e) => e.path === target)) entries.push({ label, path: target });
   };
 
   add("Desktop", resolveKnownFolder("Desktop"));
@@ -94,12 +219,33 @@ function quickAccess() {
  * Default landing spot. The Desktop is where people keep the folder they are
  * about to register far more often than the home directory is.
  */
-function defaultStartPath() {
-  return resolveKnownFolder("Desktop") || os.homedir();
+function defaultStartPath(roots = browseRoots()) {
+  const desktop = resolveKnownFolder("Desktop");
+  if (desktop && isWithinRoots(desktop, roots)) return desktop;
+  const home = os.homedir();
+  if (isWithinRoots(home, roots)) return home;
+  // Confined somewhere that excludes home: start at the first allowed root
+  // rather than at a path that will immediately be refused.
+  return roots && roots.length ? roots[0] : home;
 }
 
 async function listDirectories(rawTargetPath) {
-  const resolved = rawTargetPath ? path.resolve(String(rawTargetPath).trim()) : defaultStartPath();
+  const roots = browseRoots();
+  const resolved = rawTargetPath
+    ? path.resolve(String(rawTargetPath).trim())
+    : defaultStartPath(roots);
+
+  // Checked BEFORE the stat, so a refused path never reveals whether it
+  // exists -- otherwise the error message distinguishes "outside the allowed
+  // folders" from "does not exist", which turns this into a probe for what is
+  // on the disk.
+  if (!isWithinRoots(resolved, roots)) {
+    throw new ValidationError(
+      `That folder is outside the directories this server allows browsing. ` +
+      `Allowed: ${roots.join(", ")}. Set BROWSE_ROOTS to widen it, or type the path directly when ` +
+      "registering a location."
+    );
+  }
 
   let stat;
   try {
@@ -135,14 +281,22 @@ async function listDirectories(rawTargetPath) {
       }
     }
 
-    if (isDir) directories.push(entry.name);
-    else if (entry.isFile()) fileCount += 1;
+    if (isDir) {
+      // A symlink can point outside the allowed roots, which is the one way
+      // containment could be walked around without any `..` in the request.
+      if (isWithinRoots(path.join(resolved, entry.name), roots)) directories.push(entry.name);
+    } else if (entry.isFile()) {
+      fileCount += 1;
+    }
   }
 
   directories.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 
   const parentPath = path.dirname(resolved);
-  const parent = parentPath !== resolved ? parentPath : null;
+  // Do not offer a "up" link that leads out of the sandbox -- a button that
+  // exists and then refuses is worse than no button.
+  const parent =
+    parentPath !== resolved && isWithinRoots(parentPath, roots) ? parentPath : null;
 
   return {
     path: resolved,
@@ -152,9 +306,14 @@ async function listDirectories(rawTargetPath) {
     // wrong one.
     fileCount,
     directories: directories.map((name) => ({ name, path: path.join(resolved, name) })),
-    quickAccess: quickAccess(),
-    drives: listDrives(),
+    quickAccess: quickAccess(roots),
+    drives: listDrives(roots),
+    // So the UI can explain the boundary rather than only enforcing it.
+    confinedTo: roots,
   };
 }
 
-module.exports = { listDirectories, quickAccess, listDrives, defaultStartPath, resolveKnownFolder };
+module.exports = {
+  listDirectories, quickAccess, listDrives, defaultStartPath, resolveKnownFolder,
+  browseRoots, isWithinRoots, warnIfSharedAndUnconfined,
+};

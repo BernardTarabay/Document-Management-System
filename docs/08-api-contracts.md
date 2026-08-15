@@ -224,14 +224,14 @@ hallucinated id, on top of the system prompt telling it not to invent one).
 
 | Method | Path | Permission | Notes |
 |---|---|---|---|
-| GET | `/oauth/:provider/callback` | *(none — public)* | Hit directly by Google/Microsoft's own redirect, not by frontend JS, so it can't require an `Authorization` header. Identity is recovered from the signed `state` param instead (`jwt.signOAuthState`/`verifyOAuthState`, 10-minute expiry). Always ends in `res.redirect()` back to `${FRONTEND_URL}/inbox?connected=<email>` or `?error=<message>` — never returns JSON. Registered before the router's `authenticate` middleware for this exact reason. |
+| GET | `/oauth/:provider/callback` | *(none — public)* | Hit directly by Google's own redirect, not by frontend JS, so it can't require an `Authorization` header. Identity is recovered from the signed `state` param instead (`jwt.signOAuthState`/`verifyOAuthState`, 10-minute expiry). Always ends in `res.redirect()` back to `${FRONTEND_URL}/inbox?connected=<email>` or `?error=<message>` — never returns JSON. Registered before the router's `authenticate` middleware for this exact reason. |
 | GET | `/` | `email.manage` | Accounts connected by the logged-in user |
-| GET | `/connect/:provider` | `email.manage` | `:provider` is `gmail` or `outlook`. Returns `{ authUrl }`; frontend does `window.location.href = authUrl` — this is a full browser navigation to Google/Microsoft's consent screen, not an API call the frontend can complete in place |
+| GET | `/connect/:provider` | `email.manage` | `:provider` is `gmail` (the only supported provider; Outlook was removed). Returns `{ authUrl }`; frontend does `window.location.href = authUrl` — this is a full browser navigation to Google's consent screen, not an API call the frontend can complete in place |
 | POST | `/:id/sync` | `email.manage` | Enqueues an `email_sync` job for that account (202, same envelope as other job-enqueuing endpoints: `{ processingJobId, status }`). Syncs also run automatically every `EMAIL_SYNC_INTERVAL_MINUTES` (default 15) via `emailSyncScheduler.js` |
-| DELETE | `/:id` | `email.manage` | Disconnects: best-effort revokes the Google token (Microsoft has no equivalent revoke endpoint), clears the stored encrypted refresh token, sets `status = 'disconnected'`. Auto-sync stops; rows already in `inbox_messages` are left as-is |
+| DELETE | `/:id` | `email.manage` | Disconnects: best-effort revokes the Google token, clears the stored encrypted refresh token, sets `status = 'disconnected'`. Auto-sync stops; rows already in `inbox_messages` are left as-is |
 
-Both providers are integrated via raw `fetch()` OAuth2 calls (no `googleapis` or
-`@azure/msal-node` SDK), matching the style already used for the Gemini client. Refresh
+Gmail is integrated via raw `fetch()` OAuth2 calls (no `googleapis` SDK), matching the
+style already used for the Gemini client. It is the only provider; Outlook was removed. Refresh
 tokens are encrypted at rest with AES-256-GCM (`utils/tokenCrypto.js`, key derived from
 `TOKEN_ENCRYPTION_KEY`). See `docs/10-email-inbox.md` for the full design, including why
 periodic sync uses a plain `setInterval` (`emailSyncScheduler.js`) instead of BullMQ's
@@ -246,7 +246,7 @@ itself on each tick rather than going around it.
 | GET | `/` | `email.manage` | Query: `status` (`kept` default, or `deleted` for the "what did auto-triage remove" transparency view), `limit`, `offset`. Scoped to the logged-in user's own connected accounts via a join on `email_accounts.user_id` — one user's inbox never appears in another user's list |
 
 Each row is a triaged copy of a provider message (`inbox_messages`), not the message
-itself — the actual email always stays in Gmail/Outlook. `provider_web_link` opens that
+itself — the actual email always stays in Gmail. `provider_web_link` opens that
 real message directly in the provider's own web inbox (`window.open`, new tab). Rows are
 never deleted when a message is auto-trashed upstream; `status` flips from `kept` to
 `deleted` and the row stays, so there's always an auditable record of what the triage

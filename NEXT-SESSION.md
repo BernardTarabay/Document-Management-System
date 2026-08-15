@@ -67,7 +67,6 @@ Landed since, not from the numbered list:
   (a real reset left 15,759 jobs in Redis grinding against truncated tables),
   sweeps rows written by jobs that were mid-flight, and removes the mirror's
   shortcuts (only `.lnk`/`.url`, never anything else a user put there).
-
 Also open:
 
 - **Task #46 — 93 mirror shortcuts fail on Windows MAX_PATH.** WScript.Shell

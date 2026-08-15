@@ -9,9 +9,7 @@ const emailAccountRepository = require("../../repositories/emailAccountRepositor
 const inboxMessageRepository = require("../../repositories/inboxMessageRepository");
 const auditLogRepository = require("../../repositories/auditLogRepository");
 const googleOAuthClient = require("../../services/email/googleOAuthClient");
-const microsoftOAuthClient = require("../../services/email/microsoftOAuthClient");
 const gmailApiClient = require("../../services/email/gmailApiClient");
-const outlookApiClient = require("../../services/email/outlookApiClient");
 const emailTriageClassifier = require("../../services/ai/emailTriageClassifier");
 const tokenCrypto = require("../../utils/tokenCrypto");
 const { EmailProvider, EmailAccountStatus, InboxMessageStatus } = require("../../models/enums");
@@ -42,33 +40,21 @@ async function fetchNormalizedMessages(account, accessToken) {
     return out;
   }
 
-  const messages = await outlookApiClient.listInboxMessages(accessToken, { top: MAX_MESSAGES_PER_SYNC });
-  const out = [];
-  for (const m of messages) {
-    const existing = await inboxMessageRepository.findByAccountAndMessageId(account.id, m.id);
-    if (existing) continue;
-    out.push({
-      providerMessageId: m.id,
-      threadId: m.threadId,
-      fromName: m.fromName,
-      fromAddress: m.fromAddress,
-      subject: m.subject,
-      snippet: m.snippet,
-      receivedAt: m.receivedAt,
-      hasAttachments: m.hasAttachments,
-      webLink: m.webLink,
-      providerHints: { outlookInferenceClassification: m.inferenceClassification },
-    });
-  }
-  return out;
+  // Gmail is the only provider. A row with any other provider value can only
+  // be a leftover from before Outlook was removed, and syncing it is not
+  // possible -- there is no client for it. Refusing loudly beats returning an
+  // empty list, which would look like a mailbox with no new mail.
+  throw new Error(
+    `Email provider "${account.provider}" is no longer supported. Disconnect this account and ` +
+    "reconnect it with Gmail."
+  );
 }
 
 async function trashUpstream(account, accessToken, providerMessageId) {
-  if (account.provider === EmailProvider.GMAIL) {
-    await gmailApiClient.trashMessage(accessToken, providerMessageId);
-  } else {
-    await outlookApiClient.moveToDeletedItems(accessToken, providerMessageId);
+  if (account.provider !== EmailProvider.GMAIL) {
+    throw new Error(`Cannot trash upstream: provider "${account.provider}" is no longer supported.`);
   }
+  await gmailApiClient.trashMessage(accessToken, providerMessageId);
 }
 
 async function handle({ emailAccountId }) {
@@ -77,7 +63,14 @@ async function handle({ emailAccountId }) {
     return { skipped: true, reason: "account not connected" };
   }
 
-  const oauthClient = account.provider === EmailProvider.GMAIL ? googleOAuthClient : microsoftOAuthClient;
+  if (account.provider !== EmailProvider.GMAIL) {
+    await emailAccountRepository.markError(
+      emailAccountId,
+      `Provider "${account.provider}" is no longer supported. Disconnect and reconnect with Gmail.`
+    );
+    return { skipped: true, reason: "unsupported provider" };
+  }
+  const oauthClient = googleOAuthClient;
 
   let tokenResponse;
   try {
@@ -88,9 +81,8 @@ async function handle({ emailAccountId }) {
     throw err;
   }
 
-  // Microsoft commonly rotates the refresh token on every use; Google
-  // generally doesn't return one here at all. Either way, re-persist
-  // whatever came back so a rotated token isn't lost.
+  // Google generally does not return a refresh token on a refresh call, but
+  // re-persist whatever came back so a rotated token is never lost.
   if (tokenResponse.refresh_token) {
     await emailAccountRepository.updateTokens(emailAccountId, {
       refreshTokenEncrypted: tokenCrypto.encrypt(tokenResponse.refresh_token),

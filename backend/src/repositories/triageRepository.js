@@ -34,6 +34,7 @@
 // an import is legible rather than mysterious.
 const db = require("../config/database");
 const { REASON_KEYS } = require("../services/triageReasons");
+const { requireOwner } = require("./ownership");
 
 // Identical to the predicate in fileRepository.countBacklogByLocation and
 // dashboardRepository.attention, on purpose: "stalled" must mean the same
@@ -94,6 +95,12 @@ const REASON_CASE = `
     WHEN lj.status = 'failed'
      AND lj.finished_at < now() - interval '${FAILED_JOB_GRACE}' THEN 'job_failed'
     WHEN fc.extraction_status = 'failed'                       THEN 'extraction_failed'
+    -- 'stalled' means WORK WAS LOST -- a crash, a Redis restart -- and the
+    -- next scan will repair it. It must not fire for a file the pipeline
+    -- deliberately parked: a video has no file_content row and never will,
+    -- because there is no text in it to extract. Reporting that as "stalled"
+    -- tells the user to wait for a repair that is never coming.
+    WHEN f.pipeline_state = 'needs_user' AND f.failure_reason IS NOT NULL THEN NULL
     WHEN f.sha256_hash IS NULL OR fc.file_id IS NULL            THEN 'stalled'
     WHEN f.canonical_filename IS NOT NULL                      THEN NULL
     WHEN fc.needs_ocr                                          THEN 'needs_ocr'
@@ -154,7 +161,32 @@ const TRIAGED = `
        ORDER BY cr.created_at DESC LIMIT 1
     ) cls ON true
    WHERE f.status IN ('active', 'missing')
+     AND f.owner_user_id = $OWNER$
      AND active.present IS NULL
+     -- A file the user has already dealt with stays dealt with.
+     --
+     -- Several reasons here describe a permanent property of the document
+     -- rather than a fixable fault: a photograph of a receipt will never
+     -- have a text layer, and no amount of reprocessing changes that. Before
+     -- this, resolving such a file -- filing it, keeping its name -- left it
+     -- matching the same predicate, so it reappeared in the queue
+     -- immediately and the queue could never be emptied. user_resolved_at
+     -- records the decision, which is what turns triage from a wall into a
+     -- worklist.
+     AND f.user_resolved_at IS NULL
+     -- Photographs are NOT triage.
+     --
+     -- A JPEG has no text layer, so extract_text finds nothing, textQuality
+     -- judges the nothing unusable, and the file matched needs_ocr or
+     -- unreadable forever. That is a correct description of a photograph and
+     -- a useless thing to tell somebody: it is not stuck, it is a picture, and
+     -- the answer is to look at it. They belong in the Photos workspace, which
+     -- shows the image instead of describing its missing text.
+     --
+     -- Excluded by is_image rather than by extension so this and the Photos
+     -- query can never disagree about which files are pictures
+     -- (services/imageDetection.js owns that decision).
+     AND f.is_image = false
 `;
 
 /**
@@ -168,25 +200,27 @@ const TRIAGED = `
  * @param {object} [opts]
  * @param {string|null} [opts.reason] - restrict to one reason key
  */
-async function list({ reason = null, limit = 50, offset = 0 } = {}) {
+async function list(ownerUserId, { reason = null, limit = 50, offset = 0 } = {}) {
+  requireOwner(ownerUserId, "triage.list");
   const { rows } = await db.query(
-    `WITH triaged AS (${TRIAGED})
+    `WITH triaged AS (${body(5)})
      SELECT * FROM triaged
       WHERE reason IS NOT NULL
         AND ($1::text IS NULL OR reason = $1)
       ORDER BY array_position($2::text[], reason), imported_at DESC
       LIMIT $3 OFFSET $4`,
-    [reason, [...REASON_KEYS], limit, offset]
+    [reason, [...REASON_KEYS], limit, offset, ownerUserId]
   );
   return rows;
 }
 
 /** One file's triage row, or null if it is not in the queue. */
-async function findOne(fileId) {
+async function findOne(fileId, ownerUserId) {
+  requireOwner(ownerUserId, "triage.findOne");
   const { rows } = await db.query(
-    `WITH triaged AS (${TRIAGED})
+    `WITH triaged AS (${body(2)})
      SELECT * FROM triaged WHERE id = $1 AND reason IS NOT NULL`,
-    [fileId]
+    [fileId, ownerUserId]
   );
   return rows[0] || null;
 }
@@ -199,18 +233,22 @@ async function findOne(fileId) {
  * number a user watching triage would reasonably conclude the import had
  * finished.
  */
-async function countByReason() {
+async function countByReason(ownerUserId) {
+  requireOwner(ownerUserId, "triage.countByReason");
   const [{ rows: byReason }, { rows: inFlight }] = await Promise.all([
     db.query(
-      `WITH triaged AS (${TRIAGED})
+      `WITH triaged AS (${body(1)})
        SELECT reason, count(*)::int AS count
-         FROM triaged WHERE reason IS NOT NULL GROUP BY reason`
+         FROM triaged WHERE reason IS NOT NULL GROUP BY reason`,
+      [ownerUserId]
     ),
     db.query(
       `SELECT count(*)::int AS count
          FROM files f
         WHERE f.status = 'active'
-          AND EXISTS (${HAS_ACTIVE_JOB})`
+          AND f.owner_user_id = $1
+          AND EXISTS (${HAS_ACTIVE_JOB})`,
+      [ownerUserId]
     ),
   ]);
 
@@ -219,6 +257,19 @@ async function countByReason() {
     total: byReason.reduce((sum, r) => sum + r.count, 0),
     inFlight: inFlight[0].count,
   };
+}
+
+/**
+ * The shared body with its owner placeholder resolved to a real $n.
+ *
+ * Each caller binds a different number of parameters ahead of the owner, and
+ * the alternative -- forcing the owner to always be $1 -- would mean
+ * renumbering every other placeholder in three queries. A sentinel that is
+ * substituted once, here, keeps the SQL in one place and the numbering local
+ * to each call. `index` is a number this module supplies, never user input.
+ */
+function body(index) {
+  return TRIAGED.replace("$OWNER$", `$${index}`);
 }
 
 module.exports = { list, findOne, countByReason };

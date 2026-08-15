@@ -11,7 +11,7 @@ const PROMO_SUBJECT_PATTERN = /\b(unsubscribe|% off|sale ends|limited time offer
 
 /**
  * Instant, free classification from signals the provider already gave us
- * (Gmail labels, Outlook's inferenceClassification, List-Unsubscribe
+ * (Gmail labels, List-Unsubscribe
  * header) plus a couple of generic heuristics. Returns null ("uncertain")
  * rather than guessing when nothing here is confident either way -- that's
  * what escalates to Gemini.

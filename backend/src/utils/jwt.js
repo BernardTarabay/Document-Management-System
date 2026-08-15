@@ -50,7 +50,7 @@ function parseDurationToMs(duration) {
 /**
  * Short-lived, single-purpose JWT carried through the OAuth redirect round
  * trip (email account connect flow) so the callback knows which app user
- * and which provider initiated it -- Google/Microsoft's `state` param is
+ * and which provider initiated it -- Google's `state` param is
  * designed for exactly this ("opaque value your app can use to maintain
  * state"), and a signed JWT means no extra DB table/row just to remember
  * one pending connect attempt for a few minutes.

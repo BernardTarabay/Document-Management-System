@@ -5,18 +5,20 @@
 // moment. The old dashboard fired five list endpoints and counted the arrays,
 // which was both wrong past 200 rows and inconsistent between widgets.
 const dashboardRepository = require("../repositories/dashboardRepository");
+const { requireOwner } = require("../repositories/ownership");
 
 const num = (v) => Number(v || 0);
 
-async function summary() {
+async function summary(ownerUserId) {
+  requireOwner(ownerUserId, "dashboardService.summary");
   const [overview, attention, reclaimable, extensions, locations, jobs, trend] = await Promise.all([
-    dashboardRepository.overview(),
-    dashboardRepository.attention(),
-    dashboardRepository.reclaimableBytes(),
-    dashboardRepository.byExtension(10),
-    dashboardRepository.byLocation(),
-    dashboardRepository.recentJobs(24),
-    dashboardRepository.ingestionTrend(14),
+    dashboardRepository.overview(ownerUserId),
+    dashboardRepository.attention(ownerUserId),
+    dashboardRepository.reclaimableBytes(ownerUserId),
+    dashboardRepository.byExtension(ownerUserId, 10),
+    dashboardRepository.byLocation(ownerUserId),
+    dashboardRepository.recentJobs(ownerUserId, 24),
+    dashboardRepository.ingestionTrend(ownerUserId, 14),
   ]);
 
   const total = num(overview.total_files);

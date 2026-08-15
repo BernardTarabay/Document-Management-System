@@ -1,11 +1,29 @@
+// Storage locations, now owned.
+//
+// WHAT CHANGED AND WHY
+//
+// Registering a folder used to require `user.manage` -- the permission for
+// creating and deactivating other people's ACCOUNTS. Nothing about pointing
+// this app at your own Documents folder is an act of user administration, and
+// the conflation had a concrete cost: the only account on this install holds
+// the `User` role, so it could not perform the first step the application
+// exists for. The route is now gated on `storage.manage`, and every function
+// here takes the acting user and scopes its queries to them.
+//
+// Ownership is enforced by the QUERY, not by a check after the fact:
+// `findByIdForOwner` returns null for somebody else's location, which becomes
+// a 404. There is deliberately no code path that loads a location by id alone
+// and then compares owners -- that shape invites the check being skipped.
 const path = require("path");
 const storageLocationRepository = require("../repositories/storageLocationRepository");
+const deviceRepository = require("../repositories/deviceRepository");
 const fileRepository = require("../repositories/fileRepository");
 const auditLogRepository = require("../repositories/auditLogRepository");
 const filesystemScanRepository = require("../repositories/filesystemScanRepository");
 const { enqueueJob } = require("../queues");
 const { ValidationError } = require("../validators/validationError");
-const { JobType } = require("../models/enums");
+const { requireOwner, NotOwnedError } = require("../repositories/ownership");
+const { JobType, StorageType, StorageAccessMode } = require("../models/enums");
 
 class NotFoundError extends Error {
   constructor(message) {
@@ -15,16 +33,20 @@ class NotFoundError extends Error {
   }
 }
 
+const VALID_TYPES = new Set(Object.values(StorageType));
+const VALID_ACCESS_MODES = new Set(Object.values(StorageAccessMode));
+
 /**
  * Enriches each location with its most recent scan (status/when/counts) so
  * the Storage Locations page can show "last scanned" without a separate
  * request per card.
  */
-async function list() {
-  const locations = await storageLocationRepository.listActive();
+async function list(ownerUserId) {
+  requireOwner(ownerUserId, "storageLocationService.list");
+  const locations = await storageLocationRepository.listActive(ownerUserId);
   const [latestScans, backlog] = await Promise.all([
     filesystemScanRepository.findLatestForLocations(locations.map((l) => l.id)),
-    fileRepository.countBacklogByLocation(),
+    fileRepository.countBacklogByLocation(ownerUserId),
   ]);
   return locations.map((loc) => attachLastScan(loc, latestScans[loc.id], backlog[loc.id]));
 }
@@ -34,10 +56,21 @@ function attachLastScan(location, scan, backlog) {
   // missing field renders as nothing and is indistinguishable from a broken
   // count.
   const processing = { inFlight: backlog?.inFlight || 0, stalled: backlog?.stalled || 0 };
-  if (!scan) return { ...location, last_scan: null, processing };
+  const device = location.device_id
+    ? {
+        id: location.device_id,
+        name: location.device_name,
+        kind: location.device_kind,
+        status: location.device_status,
+        lastSeenAt: location.device_last_seen_at,
+      }
+    : null;
+
+  if (!scan) return { ...location, last_scan: null, processing, device };
   return {
     ...location,
     processing,
+    device,
     last_scan: {
       status: scan.status,
       startedAt: scan.started_at,
@@ -49,8 +82,11 @@ function attachLastScan(location, scan, backlog) {
   };
 }
 
-async function getById(id) {
-  const location = await storageLocationRepository.findById(id);
+async function getById(id, ownerUserId) {
+  requireOwner(ownerUserId, "storageLocationService.getById");
+  const location = await storageLocationRepository.findByIdForOwner(id, ownerUserId);
+  // Same message whether the id is unknown or simply not theirs -- see
+  // ownership.NotOwnedError for why distinguishing the two is a disclosure.
   if (!location) throw new NotFoundError("Storage location not found.");
   return location;
 }
@@ -77,7 +113,7 @@ function normalizeRootPath(rootPath) {
 
 /**
  * Register a Storage Location -- or re-activate the one already registered
- * for this folder.
+ * for this folder BY THIS USER.
  *
  * Re-registering matters because `remove()` only deactivates (see its own
  * note on why a hard delete isn't offered). Without this check, removing a
@@ -94,15 +130,43 @@ function normalizeRootPath(rootPath) {
  * 'active' again rather than becoming a new File with a new identity.
  */
 async function create(
-  { name, type, rootPath, accessMode = "direct", config = {}, isReadOnly = true },
+  { name, type = StorageType.LOCAL, rootPath, accessMode = "direct", config = {}, isReadOnly = true, deviceId = null },
   actorUserId
 ) {
-  if (!name || !type || !rootPath) {
-    throw new ValidationError("name, type, and rootPath are required.");
+  requireOwner(actorUserId, "storageLocationService.create");
+  if (!name || !rootPath) {
+    throw new ValidationError("A name and a folder path are required.");
   }
+  if (!VALID_TYPES.has(type)) {
+    throw new ValidationError(`Unknown storage type "${type}".`);
+  }
+  if (!VALID_ACCESS_MODES.has(accessMode)) {
+    throw new ValidationError(`Unknown access mode "${accessMode}".`);
+  }
+
   rootPath = normalizeRootPath(rootPath);
 
-  const existing = await storageLocationRepository.findByRootPath(rootPath);
+  // Which machine's disk this is. A `direct` location is on the server by
+  // definition; an `agent` location must name a device the caller owns, and
+  // the ownership check is what stops "attach my account to someone else's
+  // computer" -- a hand-written deviceId for a stranger's laptop is rejected
+  // here, not merely hidden from the picker.
+  let resolvedDeviceId = null;
+  if (accessMode === StorageAccessMode.AGENT) {
+    if (!deviceId) {
+      throw new ValidationError(
+        "An agent-brokered location must say which of your devices holds the folder."
+      );
+    }
+    const device = await deviceRepository.findByIdForOwner(deviceId, actorUserId);
+    if (!device) throw new NotOwnedError("That device");
+    resolvedDeviceId = device.id;
+  } else {
+    const serverDevice = await deviceRepository.ensureServerDevice(actorUserId);
+    resolvedDeviceId = serverDevice.id;
+  }
+
+  const existing = await storageLocationRepository.findByRootPath(rootPath, actorUserId);
   if (existing) {
     if (existing.is_active) {
       throw new ValidationError(
@@ -111,7 +175,7 @@ async function create(
       );
     }
 
-    const reactivated = await storageLocationRepository.reactivate(existing.id, {
+    const reactivated = await storageLocationRepository.reactivate(existing.id, actorUserId, {
       name, type, accessMode, config,
     });
 
@@ -132,7 +196,9 @@ async function create(
   }
 
   const location = await storageLocationRepository.create({
+    ownerUserId: actorUserId,
     name, type, rootPath, accessMode, config, isReadOnly,
+    deviceId: resolvedDeviceId,
   });
 
   await auditLogRepository.record({
@@ -140,7 +206,7 @@ async function create(
     action: "storage_location.created",
     entityType: "storage_location",
     entityId: location.id,
-    newState: { name, type, rootPath, accessMode, isReadOnly },
+    newState: { name, type, rootPath, accessMode, isReadOnly, deviceId: resolvedDeviceId },
     reason: isReadOnly
       ? "Registered read-only: files here are indexed and named, but never renamed or moved on disk."
       : "Registered writable: approved renames will be applied to the files themselves.",
@@ -150,30 +216,61 @@ async function create(
 }
 
 /**
- * Flip a location between read-only and writable.
+ * Edit a location's settings.
  *
- * Turning read-only OFF is the consequential direction -- it grants this
- * app permission to rename and move somebody's real files -- so it is
+ * Replaces the old single-purpose setReadOnly(). Turning read-only OFF is
+ * still the consequential direction -- it grants this app permission to
+ * rename and move somebody's real files -- so that specific transition is
  * audited with the reason spelled out rather than recorded as a bare field
  * change.
+ *
+ * `rootPath` is deliberately NOT editable. Repointing a location at a
+ * different folder would leave every already-ingested file's current_path
+ * describing a directory that no longer belongs to it, and the next scan
+ * would mark the whole corpus missing. Registering the new folder is the
+ * correct action, and it keeps both histories.
  */
-async function setReadOnly(id, isReadOnly, actorUserId) {
-  const location = await getById(id);
-  const updated = await storageLocationRepository.setReadOnly(id, Boolean(isReadOnly));
+async function update(id, patch, actorUserId) {
+  const location = await getById(id, actorUserId);
+
+  const updated = await storageLocationRepository.updateForOwner(id, actorUserId, patch);
+  if (!updated) throw new NotFoundError("Storage location not found.");
+
+  const readOnlyChanged =
+    patch.isReadOnly !== undefined && Boolean(patch.isReadOnly) !== location.is_read_only;
 
   await auditLogRepository.record({
     userId: actorUserId,
-    action: "storage_location.read_only_changed",
+    action: readOnlyChanged ? "storage_location.read_only_changed" : "storage_location.updated",
     entityType: "storage_location",
     entityId: id,
-    previousState: { isReadOnly: location.is_read_only },
-    newState: { isReadOnly: Boolean(isReadOnly) },
-    reason: isReadOnly
-      ? "Set read-only: approved renames will no longer touch files in this location."
-      : "Set writable: approved renames will now rename and move the actual files on disk.",
+    previousState: {
+      name: location.name,
+      isReadOnly: location.is_read_only,
+      watchEnabled: location.watch_enabled,
+      autoApplyNaming: location.auto_apply_naming,
+      replicationEnabled: location.replication_enabled,
+    },
+    newState: {
+      name: updated.name,
+      isReadOnly: updated.is_read_only,
+      watchEnabled: updated.watch_enabled,
+      autoApplyNaming: updated.auto_apply_naming,
+      replicationEnabled: updated.replication_enabled,
+    },
+    reason: readOnlyChanged
+      ? (updated.is_read_only
+          ? "Set read-only: approved renames will no longer touch files in this location."
+          : "Set writable: approved renames will now rename and move the actual files on disk.")
+      : "Edited from the Storage Locations page",
   });
 
   return updated;
+}
+
+/** Kept as a thin alias so existing callers and tests keep working. */
+async function setReadOnly(id, isReadOnly, actorUserId) {
+  return update(id, { isReadOnly: Boolean(isReadOnly) }, actorUserId);
 }
 
 /**
@@ -182,17 +279,31 @@ async function setReadOnly(id, isReadOnly, actorUserId) {
  * potentially huge directory tree (spec §18/§30).
  */
 async function triggerScan(storageLocationId, actorUserId) {
-  const location = await getById(storageLocationId);
+  const location = await getById(storageLocationId, actorUserId);
   if (!location.is_active) {
     throw new ValidationError(
       `"${location.name}" has been removed. Add the folder again to re-activate it before scanning.`
     );
   }
 
+  // A scan of a folder on another machine needs that machine to answer. Said
+  // up front, because the alternative is a job that sits queued for hours and
+  // then fails with a timeout nobody connects to the closed laptop.
+  if (location.access_mode === StorageAccessMode.AGENT && location.device_id) {
+    const online = await deviceRepository.isOnline(location.device_id);
+    if (!online) {
+      const device = await deviceRepository.findByIdForOwner(location.device_id, actorUserId);
+      throw new ValidationError(
+        `"${location.name}" is on ${device?.name || "another device"}, which is not connected right now. ` +
+        "Start the agent on that machine and try again."
+      );
+    }
+  }
+
   const job = await enqueueJob(
     JobType.SCAN,
     { storageLocationId },
-    { storageLocationId, createdBy: actorUserId }
+    { storageLocationId, createdBy: actorUserId, ownerUserId: actorUserId }
   );
 
   await auditLogRepository.record({
@@ -217,9 +328,9 @@ async function triggerScan(storageLocationId, actorUserId) {
  * project's schema was deliberately designed to avoid.)
  */
 async function remove(id, actorUserId) {
-  const location = await getById(id);
+  const location = await getById(id, actorUserId);
 
-  const updated = await storageLocationRepository.deactivate(id);
+  const updated = await storageLocationRepository.deactivate(id, actorUserId);
 
   await auditLogRepository.record({
     userId: actorUserId,
@@ -235,7 +346,7 @@ async function remove(id, actorUserId) {
 }
 
 module.exports = {
-  NotFoundError, list, getById, create, triggerScan, remove, setReadOnly,
+  NotFoundError, list, getById, create, update, setReadOnly, triggerScan, remove,
   // Exported for tests: this is the function that decides whether two
   // spellings of a path are the same folder, which is what stops a re-add
   // from creating a second location.

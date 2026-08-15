@@ -14,7 +14,12 @@ const { DuplicateGroupType } = require("../../models/enums");
 
 const BATCH_SIZE = 100;
 
-async function handle({ actorUserId }, bullJob) {
+async function handle({ actorUserId, ownerUserId }, bullJob) {
+  // Whose duplicate groups this resolves. Never defaulted: an unscoped sweep
+  // would pick a canonical copy for every account's groups from one person's
+  // button press.
+  ownerUserId = ownerUserId || actorUserId;
+  if (!ownerUserId) throw new Error("auto_resolve_duplicates requires the owner whose groups it resolves.");
   const summary = { resolved: 0, skipped: 0, failed: 0 };
   let processed = 0;
 
@@ -30,11 +35,11 @@ async function handle({ actorUserId }, bullJob) {
   // duplicateGroupService assumes byte-identical members, which is only
   // true for exact groups. duplicateGroupService.autoResolveGroup enforces
   // the same rule independently.
-  const startingOpen = await duplicateGroupRepository.countOpen(DuplicateGroupType.EXACT);
+  const startingOpen = await duplicateGroupRepository.countOpen(ownerUserId, DuplicateGroupType.EXACT);
   const maxBatches = Math.max(1, Math.ceil(startingOpen / BATCH_SIZE)) + 5;
 
   for (let batchCount = 0; batchCount < maxBatches; batchCount += 1) {
-    const page = await duplicateGroupRepository.listOpen({
+    const page = await duplicateGroupRepository.listOpen(ownerUserId, {
       limit: BATCH_SIZE,
       offset: 0,
       groupType: DuplicateGroupType.EXACT,
@@ -49,7 +54,7 @@ async function handle({ actorUserId }, bullJob) {
         status: "pending",
       });
       try {
-        const resolved = await duplicateGroupService.autoResolveGroup(group.id, actorUserId);
+        const resolved = await duplicateGroupService.autoResolveGroup(group.id, ownerUserId);
         if (resolved) {
           summary.resolved += 1;
           await processingJobItemRepository.complete(jobItem.id, {

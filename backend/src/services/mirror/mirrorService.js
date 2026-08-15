@@ -14,20 +14,41 @@ const path = require("path");
 const fileRepository = require("../../repositories/fileRepository");
 const env = require("../../config/env");
 const { resolveWithinRoot } = require("../../utils/pathSafety");
+const { requireOwner } = require("../../repositories/ownership");
 const { writeShortcuts, shortcutNameFor } = require("./shortcutWriter");
 
 // Batch size for shortcut writing. Large enough that PowerShell startup
 // cost is amortized, small enough that one failure doesn't lose much work.
 const BATCH_SIZE = 250;
 
-function mirrorRoot() {
+/**
+ * Where one user's mirror lives.
+ *
+ * MIRROR_ROOT is a single folder on the machine running the backend, and the
+ * mirror is derived entirely from one account's files -- so with more than one
+ * account, writing them all into the same directory would interleave two
+ * people's document trees and let the prune pass of one delete the shortcuts
+ * of the other. Each owner therefore gets a subfolder.
+ *
+ * The segment is the account's uuid, not its name or email: this is a real
+ * directory somebody may open in Explorer, and a folder named after a
+ * colleague's email address is a disclosure that serves no purpose. The
+ * Storage Locations page shows the resolved path, so nobody has to guess
+ * which folder is theirs.
+ */
+function mirrorRoot(ownerUserId) {
   if (!env.mirrorRoot) {
     throw new Error(
       "MIRROR_ROOT is not set -- required before the organized shortcut folder can be built. " +
       "Point it at somewhere convenient, e.g. a folder on the Desktop."
     );
   }
-  return path.resolve(env.mirrorRoot);
+  const base = path.resolve(env.mirrorRoot);
+  if (!ownerUserId) return base;
+  // resolveWithinRoot is belt-and-braces: the id comes from a uuid column, so
+  // it cannot contain a separator, but this path is built by concatenation
+  // and that is the shape that later grows a traversal bug.
+  return resolveWithinRoot(base, ownerUserId);
 }
 
 /** Strip characters Windows rejects in a path segment. */
@@ -104,8 +125,9 @@ function disambiguate(relativePath, taken) {
  *   currently justified by the database does not belong in it.
  * @param {(progress: {processed: number, total: number}) => void} [opts.onProgress]
  */
-async function sync({ prune = true, onProgress = () => {} } = {}) {
-  const root = mirrorRoot();
+async function sync({ ownerUserId, prune = true, onProgress = () => {} } = {}) {
+  requireOwner(ownerUserId, "mirrorService.sync");
+  const root = mirrorRoot(ownerUserId);
   await ensureDir(root);
 
   const summary = {
@@ -126,7 +148,7 @@ async function sync({ prune = true, onProgress = () => {} } = {}) {
   // every row into memory at once.
   const PAGE = 1000;
   for (let offset = 0; ; offset += PAGE) {
-    const page = await fileRepository.listForMirror({ limit: PAGE, offset });
+    const page = await fileRepository.listForMirror(ownerUserId, { limit: PAGE, offset });
     if (page.length === 0) break;
 
     for (const file of page) {

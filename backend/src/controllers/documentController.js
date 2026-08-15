@@ -1,11 +1,11 @@
 const documentService = require("../services/documentService");
 
 async function list(req, res) {
-  res.json(await documentService.search(req.query));
+  res.json(await documentService.search(req.query, req.user.id));
 }
 
 async function getOne(req, res) {
-  res.json(await documentService.getById(req.params.id));
+  res.json(await documentService.getById(req.params.id, req.user.id));
 }
 
 async function update(req, res) {

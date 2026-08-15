@@ -14,6 +14,8 @@ router.use(authenticate, requirePermission("document.view"));
 // taxonomy is built from classification rather than from folder names.
 
 router.get("/", asyncHandler(controller.list));
+// Before "/:id/..." so the literal segment is never read as a subject id.
+router.get("/recent", asyncHandler(controller.recentDestinations));
 router.get("/:id/documents", asyncHandler(controller.documentsForSubject));
 // Structural taxonomy changes (create/rename/delete a Subject/Category/
 // Subcategory) are gated behind subject.manage, distinct from

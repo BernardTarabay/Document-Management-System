@@ -3,8 +3,17 @@ const { createBaseRepository } = require("./baseRepository");
 
 const base = createBaseRepository("classification_results");
 
-async function create({ fileId, classifiedSubjectId = null, classifiedDocumentTypeId = null, confidenceLevel, confidenceScore = null, method, rawOutput = null }) {
-  const { rows } = await db.query(
+/**
+ * @param {object} fields
+ * @param {import('pg').PoolClient} [client] - run inside a caller's
+ *   transaction. fileOrganizeService writes this row and the file's placement
+ *   provenance together, and a file whose provenance says "you chose this"
+ *   while its classification still points at the old folder is worse than
+ *   either write failing on its own.
+ */
+async function create({ fileId, classifiedSubjectId = null, classifiedDocumentTypeId = null, confidenceLevel, confidenceScore = null, method, rawOutput = null }, client = null) {
+  const exec = client || db;
+  const { rows } = await exec.query(
     `INSERT INTO classification_results (
        file_id, classified_subject_id, classified_document_type_id,
        confidence_level, confidence_score, method, raw_output

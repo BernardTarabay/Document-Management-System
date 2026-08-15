@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
-  LifeBuoy, RefreshCw, RotateCcw, Pencil, FolderInput, Eye, Activity,
+  LifeBuoy, RefreshCw, Trash2, Pencil, FolderInput, Eye, Activity, CheckSquare, Square,
   AlertTriangle, ScanLine, FileWarning, HelpCircle, CircleSlash, Hourglass,
 } from "lucide-react";
 import { api } from "../services/apiClient";
@@ -14,6 +14,8 @@ import { Pagination } from "../components/Pagination";
 import { PreviewModal } from "../components/PreviewModal";
 import { EditFileModal } from "../components/EditFileModal";
 import { MoveFileModal } from "../components/MoveFileModal";
+import { MoveManyModal } from "../components/MoveManyModal";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { useToast } from "../context/ToastContext";
 import { useAuth } from "../context/AuthContext";
 import { formatBytes } from "../utils/format";
@@ -89,6 +91,10 @@ export function TriagePage() {
   const [offset, setOffset] = useState(0);
   const [busyId, setBusyId] = useState(null);
   const [previewFileId, setPreviewFileId] = useState(null);
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkMoveOpen, setBulkMoveOpen] = useState(false);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
   const [editTarget, setEditTarget] = useState(null);
   const [moveTarget, setMoveTarget] = useState(null);
   const { push } = useToast();
@@ -119,17 +125,54 @@ export function TriagePage() {
     reloadSummary();
   }
 
-  async function retry(row) {
+  /**
+   * RETRY IS GONE FROM THIS PAGE, DELIBERATELY.
+   *
+   * It re-ran a pipeline stage, and for everything that actually collects in
+   * this queue -- a photo with no text layer, a video, a document whose text
+   * extracted as noise -- the stage reaches the same conclusion again, because
+   * the conclusion is right. The file came straight back, so the button read
+   * as doing nothing.
+   *
+   * What clears triage is a decision: put the file somewhere, or get rid of
+   * it. Those are what this page offers now. The retry endpoint still exists
+   * for a stage that died on a transient fault, and the Jobs page is where
+   * that belongs -- it is a property of the failed job, not of the document.
+   */
+  async function removeOne(row) {
     setBusyId(row.id);
     try {
-      const res = await api.post(`/triage/${row.id}/retry`);
-      push(`Re-running ${res.jobType.replace(/_/g, " ")} — watch the jobs dock for progress.`, "success");
+      await api.del(`/triage/${row.id}`);
+      push(`Removed "${row.filename_current}". The file on disk is untouched.`, "success");
       removeLocally(row.id);
     } catch (err) {
       push(err.message, "error");
     } finally {
       setBusyId(null);
+      setDeleteTarget(null);
     }
+  }
+
+  async function removeSelected() {
+    const ids = [...selected];
+    try {
+      const r = await api.post("/triage/delete", { fileIds: ids });
+      push(`Removed ${r.removed} file${r.removed === 1 ? "" : "s"}. Nothing was erased from disk.`, "success");
+      ids.forEach(removeLocally);
+      setSelected(new Set());
+    } catch (err) {
+      push(err.message, "error");
+    } finally {
+      setBulkDeleteOpen(false);
+    }
+  }
+
+  function toggle(id) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
   }
 
   const reasons = summary?.reasons || [];
@@ -210,10 +253,46 @@ export function TriagePage() {
           }
         />
       ) : (
+        <>
+        {selected.size > 0 && (
+          <div className="glass-card mb-3 flex flex-wrap items-center gap-2 border-brand-500/25 bg-brand-500/[0.05] p-3">
+            <span className="text-sm text-base-100">{selected.size} selected</span>
+            <button className="btn-ghost btn-sm" onClick={() => setSelected(new Set())}>Clear</button>
+            <div className="flex-1" />
+            {hasPermission("document.move") && (
+              <button className="btn-primary btn-sm" onClick={() => setBulkMoveOpen(true)}>
+                <FolderInput size={14} /> Move to folder
+              </button>
+            )}
+            {hasPermission("document.delete") && (
+              <button className="btn-ghost btn-sm text-rose-300" onClick={() => setBulkDeleteOpen(true)}>
+                <Trash2 size={14} /> Remove
+              </button>
+            )}
+          </div>
+        )}
         <div className="table-shell glass-card">
           <table className="w-full text-left text-sm">
             <thead>
               <tr className="border-b border-white/5 text-xs uppercase tracking-wider text-base-400">
+                <th className="w-8 px-2 py-3">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSelected(
+                        rows?.length && selected.size === rows.length
+                          ? new Set()
+                          : new Set((rows || []).map((r) => r.id))
+                      )
+                    }
+                    aria-label="Select all on this page"
+                    className="text-base-500 hover:text-base-200"
+                  >
+                    {rows?.length && selected.size === rows.length
+                      ? <CheckSquare size={14} className="text-brand-300" />
+                      : <Square size={14} />}
+                  </button>
+                </th>
                 <th className="px-4 py-3 font-medium">File</th>
                 <th className="px-4 py-3 font-medium">Reason</th>
                 <th className="px-4 py-3 font-medium">What happened</th>
@@ -226,7 +305,26 @@ export function TriagePage() {
             </thead>
             <tbody>
               {rows.map((row) => (
-                <tr key={row.id} className="table-row-hover border-b border-white/5 align-top last:border-0">
+                <tr
+                  key={row.id}
+                  className={
+                    "table-row-hover border-b border-white/5 align-top last:border-0 " +
+                    (selected.has(row.id) ? "bg-brand-500/[0.06]" : "")
+                  }
+                >
+                  <td className="px-2 py-3">
+                    <button
+                      type="button"
+                      onClick={() => toggle(row.id)}
+                      aria-label={selected.has(row.id) ? "Deselect" : "Select"}
+                      aria-pressed={selected.has(row.id)}
+                      className="text-base-500 hover:text-base-200"
+                    >
+                      {selected.has(row.id)
+                        ? <CheckSquare size={14} className="text-brand-300" />
+                        : <Square size={14} />}
+                    </button>
+                  </td>
                   <td className="max-w-xs px-4 py-3">
                     <p className="truncate font-medium text-base-100" title={row.filename_current}>
                       {row.canonical_filename || row.filename_current}
@@ -271,18 +369,14 @@ export function TriagePage() {
                           <FolderInput size={13} />
                         </button>
                       )}
-                      {hasPermission("scan.run") && (
+                      {hasPermission("document.delete") && (
                         <button
-                          className="btn-secondary btn-sm"
-                          disabled={!row.retryable || busyId === row.id}
-                          onClick={() => retry(row)}
-                          title={
-                            row.retryable
-                              ? `Re-run ${row.retryJobType.replace(/_/g, " ")} for this file`
-                              : row.retryBlockedMessage
-                          }
+                          className="btn-ghost btn-sm text-rose-300"
+                          disabled={busyId === row.id}
+                          onClick={() => setDeleteTarget(row)}
+                          title="Remove this file from Atlas. Nothing is erased from your disk."
                         >
-                          <RotateCcw size={13} /> Retry
+                          <Trash2 size={13} />
                         </button>
                       )}
                     </div>
@@ -294,7 +388,42 @@ export function TriagePage() {
           {/* summary.total was already on this page and simply never passed. */}
           <Pagination offset={offset} limit={LIMIT} total={summary?.total} pageCount={rows?.length} onChange={setOffset} />
         </div>
+        </>
       )}
+
+      {bulkMoveOpen && (
+        <MoveManyModal
+          fileIds={[...selected]}
+          endpoint="/triage/move"
+          title={`File ${selected.size} document${selected.size === 1 ? "" : "s"}`}
+          onClose={() => setBulkMoveOpen(false)}
+          onMoved={() => {
+            [...selected].forEach(removeLocally);
+            setSelected(new Set());
+            setBulkMoveOpen(false);
+          }}
+        />
+      )}
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        title={`Remove ${selected.size} file${selected.size === 1 ? "" : "s"}?`}
+        description="They are marked removed in Atlas and disappear from these lists. Nothing is erased from your disk — the actual files stay exactly where they are."
+        confirmLabel="Remove"
+        danger
+        onConfirm={removeSelected}
+        onClose={() => setBulkDeleteOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        title={deleteTarget ? `Remove "${deleteTarget.filename_current}"?` : ""}
+        description="It is marked removed in Atlas and disappears from these lists. Nothing is erased from your disk — the file stays exactly where it is."
+        confirmLabel="Remove"
+        danger
+        onConfirm={() => removeOne(deleteTarget)}
+        onClose={() => setDeleteTarget(null)}
+      />
 
       <PreviewModal fileId={previewFileId} onClose={() => setPreviewFileId(null)} />
 

@@ -32,24 +32,77 @@ function getQueue(jobType) {
 }
 
 /**
+ * Work out whose archive a job acts on.
+ *
+ * Tried in order of directness, and every source is an authoritative fact
+ * about the work rather than a guess:
+ *
+ *   1. an explicit ownerUserId from the caller
+ *   2. the storage location -- a location belongs to exactly one account
+ *   3. the file in the payload -- likewise, and this is what makes the
+ *      stage-chaining processors work without threading an owner through
+ *      every one of them (hash -> extract_text -> classify -> generate_names
+ *      each enqueue the next with only a fileId)
+ *   4. the person who asked, for jobs that act on no particular file
+ *
+ * Deliberately no fifth fallback. If none of these apply the job has no owner,
+ * and processingJobRepository.create refuses it -- which surfaces as a failed
+ * enqueue at development time instead of a row nobody can see.
+ */
+async function resolveOwner(jobType, payload = {}, opts = {}) {
+  if (opts.ownerUserId) return opts.ownerUserId;
+
+  // Lazy requires: these repositories pull in the ownership helpers, and
+  // requiring them at module load creates a cycle back through the services
+  // that enqueue jobs.
+  if (opts.storageLocationId) {
+    const storageLocationRepository = require("../repositories/storageLocationRepository");
+    const location = await storageLocationRepository.findById(opts.storageLocationId);
+    if (location?.owner_user_id) return location.owner_user_id;
+  }
+
+  if (payload?.fileId) {
+    const fileRepository = require("../repositories/fileRepository");
+    const file = await fileRepository.findById(payload.fileId);
+    if (file?.owner_user_id) return file.owner_user_id;
+  }
+
+  return opts.createdBy || null;
+}
+
+/**
  * Create the `processing_jobs` row (source of truth) AND enqueue the BullMQ
  * job that will act on it, atomically enough for our purposes: the DB row is
  * created first, so even if the Redis enqueue fails, the job is visible as
  * failed/stuck rather than invisible.
  *
+ * OWNERSHIP
+ *
+ * Every job belongs to exactly one account, because every job acts on exactly
+ * one account's files. `ownerUserId` is required; when it is not supplied
+ * explicitly it is resolved from the storage location, which is the other
+ * thing that carries an owner. A job that could be created without one would
+ * be invisible on its owner's Jobs page and visible on everyone else's, so
+ * this refuses rather than defaulting.
+ *
  * @param {string} jobType - one of JobType
  * @param {object} payload - job-specific input (e.g. { storageLocationId } for scan, { fileId } for hash)
  * @param {object} [opts]
  * @param {string} [opts.storageLocationId]
+ * @param {string} [opts.ownerUserId] - whose archive this acts on; derived from
+ *   the storage location when omitted
  * @param {string} [opts.createdBy] - user id, or null for system-initiated jobs
  * @param {number} [opts.progressTotal]
  */
 async function enqueueJob(jobType, payload, opts = {}) {
+  const ownerUserId = await resolveOwner(jobType, payload, opts);
+
   const jobRow = await processingJobRepository.create({
     jobType,
     storageLocationId: opts.storageLocationId || null,
     payload,
     createdBy: opts.createdBy || null,
+    ownerUserId,
     progressTotal: opts.progressTotal || 0,
   });
 

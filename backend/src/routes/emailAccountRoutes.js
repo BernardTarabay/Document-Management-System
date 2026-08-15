@@ -6,7 +6,7 @@ const { asyncHandler } = require("../middleware/asyncHandler");
 
 const router = express.Router();
 
-// Public on purpose: Google/Microsoft redirect the browser here directly
+// Public on purpose: Google redirects the browser here directly
 // with no Authorization header, so this route can't sit behind the
 // `authenticate` middleware every other route in this file uses. Identity
 // is instead recovered from the signed `state` param (see

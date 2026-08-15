@@ -19,6 +19,29 @@ const FileStatus = Object.freeze({
   CHANGED: "changed", DELETED: "deleted", ARCHIVED: "archived",
 });
 
+/** migration 032. The pipeline position of a file -- see services/pipelineState.js. */
+const FilePipelineState = Object.freeze({
+  DISCOVERED: "discovered", PROCESSING: "processing", NEEDS_USER: "needs_user",
+  COMPLETED: "completed", FAILED_RETRYABLE: "failed_retryable",
+  FAILED_TERMINAL: "failed_terminal", ARCHIVED: "archived",
+});
+
+/** migration 032. */
+const OcrStatus = Object.freeze({
+  NOT_NEEDED: "not_needed", PENDING: "pending", QUEUED: "queued", RUNNING: "running",
+  COMPLETED: "completed", FAILED: "failed", UNAVAILABLE: "unavailable",
+});
+
+/** migration 030. */
+const DeviceStatus = Object.freeze({
+  ONLINE: "online", OFFLINE: "offline", NEVER_CONNECTED: "never_connected", REVOKED: "revoked",
+});
+
+/** migration 030. Where a file's bytes are, and whether they are current. */
+const ReplicaState = Object.freeze({
+  PRESENT: "present", MISSING: "missing", STALE: "stale", PENDING: "pending", FAILED: "failed",
+});
+
 const ProcessingStatus = Object.freeze({
   PENDING: "pending", PROCESSING: "processing", COMPLETED: "completed",
   FAILED: "failed", SKIPPED: "skipped",
@@ -54,6 +77,9 @@ const JobType = Object.freeze({
   BULK_MOVE: "bulk_move", REINDEX: "reindex", BULK_DELETE: "bulk_delete",
   AUTO_RESOLVE_DUPLICATES: "auto_resolve_duplicates", EMAIL_SYNC: "email_sync",
   SYNC_MIRROR: "sync_mirror",
+  // migration 031. OCR is implemented (jobs/processors/ocrProcessor.js);
+  // REPLICATE is declared but has no processor -- see jobs/index.js.
+  OCR: "ocr", REPLICATE: "replicate",
 });
 
 const JobStatus = Object.freeze({
@@ -80,7 +106,13 @@ const AuditStatus = Object.freeze({ SUCCESS: "success", FAILED: "failed" });
 
 const SubjectLevel = Object.freeze({ SUBJECT: "subject", CATEGORY: "category", SUBCATEGORY: "subcategory" });
 
-const EmailProvider = Object.freeze({ GMAIL: "gmail", OUTLOOK: "outlook" });
+// Gmail only. The Outlook/Microsoft Graph provider was removed -- see
+// services/emailAccountService.js. The Postgres enum still carries 'outlook'
+// as a value (dropping a value from an enum in place is not supported and
+// would break any historical row), but nothing accepts it: assertValidProvider
+// checks against THIS object, so an 'outlook' connection can no longer be
+// created, refreshed or synced.
+const EmailProvider = Object.freeze({ GMAIL: "gmail" });
 
 const EmailAccountStatus = Object.freeze({ CONNECTED: "connected", DISCONNECTED: "disconnected", ERROR: "error" });
 
@@ -90,7 +122,7 @@ const InboxMessageStatus = Object.freeze({ KEPT: "kept", DELETED: "deleted" });
 
 module.exports = {
   UserStatus, ConfidenceLevel, StorageType, StorageAccessMode, AgentStatus,
-  FileStatus, ProcessingStatus, DocumentStatus, VersionStatus, DetectionMethod,
+  FileStatus, FilePipelineState, OcrStatus, DeviceStatus, ReplicaState, ProcessingStatus, DocumentStatus, VersionStatus, DetectionMethod,
   RelevanceType, AssignedByType, RelatedDocRelationship, DuplicateGroupType,
   DuplicateGroupStatus, JobType, JobStatus, JobItemStatus, ProposalStatus,
   ClassificationStatus, ClassificationMethod, AuditStatus, SubjectLevel,

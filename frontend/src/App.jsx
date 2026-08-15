@@ -14,6 +14,8 @@ import { DuplicateGroupsPage } from "./pages/DuplicateGroupsPage";
 import { RenameProposalsPage } from "./pages/RenameProposalsPage";
 import { ProcessingJobsPage } from "./pages/ProcessingJobsPage";
 import { TriagePage } from "./pages/TriagePage";
+import { PhotosPage } from "./pages/PhotosPage";
+import { DevicesPage } from "./pages/DevicesPage";
 import { StorageLocationsPage } from "./pages/StorageLocationsPage";
 import { AuditLogPage } from "./pages/AuditLogPage";
 import { UsersPage } from "./pages/UsersPage";
@@ -36,6 +38,8 @@ function App() {
               <Route path="/duplicates" element={<DuplicateGroupsPage />} />
               <Route path="/rename-proposals" element={<RenameProposalsPage />} />
               <Route path="/triage" element={<TriagePage />} />
+              <Route path="/photos" element={<PhotosPage />} />
+              <Route path="/devices" element={<DevicesPage />} />
               <Route path="/jobs" element={<ProcessingJobsPage />} />
               <Route path="/storage-locations" element={<StorageLocationsPage />} />
               <Route path="/audit-log" element={<AuditLogPage />} />

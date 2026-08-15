@@ -83,7 +83,7 @@ class StorageWatcher {
 
   /** Sync the set of active watchers with the set of watched locations. */
   async refresh() {
-    const locations = (await storageLocationRepository.listActive()).filter(
+    const locations = (await storageLocationRepository.listActiveAllOwners()).filter(
       (l) => l.watch_enabled && l.access_mode === "direct"
     );
     const wanted = new Set(locations.map((l) => l.id));
@@ -145,7 +145,7 @@ class StorageWatcher {
 
   /** The safety net: scan every watched location regardless of events. */
   async sweep() {
-    const locations = (await storageLocationRepository.listActive()).filter(
+    const locations = (await storageLocationRepository.listActiveAllOwners()).filter(
       (l) => l.watch_enabled && l.access_mode === "direct"
     );
     for (const location of locations) {

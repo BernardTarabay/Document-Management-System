@@ -18,12 +18,18 @@ const emailSyncProcessor = require("./processors/emailSyncProcessor");
 const detectVersionsProcessor = require("./processors/detectVersionsProcessor");
 const reindexProcessor = require("./processors/reindexProcessor");
 const syncMirrorProcessor = require("./processors/syncMirrorProcessor");
+const ocrProcessor = require("./processors/ocrProcessor");
 
-// `bulk_move` remains the one job_type with no processor: it was superseded
-// by bulk_rename, which can already carry a new folder via
-// `proposed_relative_dir` (docs/06-processing-pipeline.md §6.1). Enqueuing
-// it would sit queued/unpicked rather than silently pretending to run --
-// an honest failure mode, not a bug.
+// `bulk_move` and `replicate` are the job_types with no processor here.
+//
+// `bulk_move` was superseded by bulk_rename, which can already carry a new
+// folder via `proposed_relative_dir` (docs/06-processing-pipeline.md §6.1);
+// filing a document under a subject is a database-only operation handled
+// synchronously by fileOrganizeService, so it never needed a queue.
+//
+// `replicate` exists in the enum for the opt-in server-side copy described in
+// migration 030, and is NOT implemented. Enqueuing either sits queued and
+// unpicked rather than silently pretending to run -- an honest failure mode.
 const PROCESSORS = {
   [JobType.SCAN]: scanProcessor,
   [JobType.HASH]: hashProcessor,
@@ -34,6 +40,7 @@ const PROCESSORS = {
   [JobType.DETECT_VERSIONS]: detectVersionsProcessor,
   [JobType.REINDEX]: reindexProcessor,
   [JobType.SYNC_MIRROR]: syncMirrorProcessor,
+  [JobType.OCR]: ocrProcessor,
   [JobType.GENERATE_NAMES]: generateNamesProcessor,
   [JobType.BULK_RENAME]: bulkRenameProcessor,
   [JobType.BULK_DELETE]: bulkDeleteProcessor,

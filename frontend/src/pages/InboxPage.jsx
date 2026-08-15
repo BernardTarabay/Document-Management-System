@@ -17,7 +17,11 @@ import { relativeTime, formatDate } from "../utils/format";
 
 const LIMIT = 25;
 
-const PROVIDER_LABEL = { gmail: "Gmail", outlook: "Outlook" };
+// Gmail only. The Outlook provider was removed from the backend, so offering
+// it here would produce a button that 400s. Accounts connected before the
+// removal still render -- the label falls back to the raw provider value --
+// so a leftover row is visible and disconnectable rather than invisible.
+const PROVIDER_LABEL = { gmail: "Gmail" };
 
 export function InboxPage() {
   const { push } = useToast();
@@ -42,7 +46,7 @@ export function InboxPage() {
   const [disconnectTarget, setDisconnectTarget] = useState(null);
   const [disconnecting, setDisconnecting] = useState(false);
 
-  // Google/Microsoft's redirect lands back here with ?connected=<email> or
+  // Google's redirect lands back here with ?connected=<email> or
   // ?error=<message> after the OAuth round trip. Surface it once as a
   // toast, then strip the params so a refresh doesn't re-show it and so
   // the URL looks like a normal page again.
@@ -115,16 +119,11 @@ export function InboxPage() {
     <div>
       <PageHeader
         title="Inbox"
-        description="Connect Gmail or Outlook to auto-triage your inbox — junk and promo mail is removed automatically, everything relevant shows up here."
+        description="Connect Gmail to auto-triage your inbox — junk and promo mail is removed automatically, everything relevant shows up here."
         actions={
-          <>
-            <button className="btn-secondary btn-sm" disabled={connecting === "gmail"} onClick={() => connect("gmail")}>
-              <Plus size={14} /> {connecting === "gmail" ? "Redirecting…" : "Connect Gmail"}
-            </button>
-            <button className="btn-secondary btn-sm" disabled={connecting === "outlook"} onClick={() => connect("outlook")}>
-              <Plus size={14} /> {connecting === "outlook" ? "Redirecting…" : "Connect Outlook"}
-            </button>
-          </>
+          <button className="btn-secondary btn-sm" disabled={connecting === "gmail"} onClick={() => connect("gmail")}>
+            <Plus size={14} /> {connecting === "gmail" ? "Redirecting…" : "Connect Gmail"}
+          </button>
         }
       />
 
@@ -136,7 +135,7 @@ export function InboxPage() {
         <EmptyState
           icon={InboxIcon}
           title="No inbox connected yet"
-          description="Connect a Gmail or Outlook account above. Once connected, we automatically remove ads, spam, and other clutter, and surface everything else right here."
+          description="Connect a Gmail account above. Once connected, we automatically remove ads, spam, and other clutter, and surface everything else right here."
         />
       ) : (
         <>

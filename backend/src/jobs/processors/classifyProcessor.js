@@ -65,7 +65,9 @@ async function runAiEscalation({ file, bodyText, allSubjects, allDocTypes, embed
     }
 
     if (file.sha256_hash) {
-      const sibling = await fileRepository.findClassifiedSiblingByHash(file.sha256_hash, file.id);
+      const sibling = await fileRepository.findClassifiedSiblingByHash(
+        file.sha256_hash, file.id, file.owner_user_id
+      );
       if (sibling) {
         await fileRepository.updateAiEnrichment(file.id, {
           shortTitle: sibling.ai_short_title,

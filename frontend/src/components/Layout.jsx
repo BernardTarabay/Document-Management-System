@@ -1,7 +1,5 @@
-import { useState } from "react";
 import { Outlet, useNavigate } from "react-router-dom";
-import { Sidebar } from "./Sidebar";
-import { Topbar } from "./Topbar";
+import { TopNav } from "./TopNav";
 import { useAuth } from "../context/AuthContext";
 import { useToast } from "../context/ToastContext";
 import { useIdleLogout } from "../hooks/useIdleLogout";
@@ -19,9 +17,6 @@ export function Layout() {
   const { logout } = useAuth();
   const { push } = useToast();
   const navigate = useNavigate();
-  // Drawer state for the sidebar below the lg breakpoint. Owned here rather
-  // than in Sidebar so Topbar's hamburger can open it.
-  const [navOpen, setNavOpen] = useState(false);
 
   useIdleLogout(
     async () => {
@@ -38,16 +33,23 @@ export function Layout() {
     // this file" should be answerable wherever you happen to be. Pages
     // publish what is on screen via usePublishAssistantContext.
     <AssistantProvider>
-      <div className="flex h-screen w-full overflow-hidden">
-        <Sidebar open={navOpen} onClose={() => setNavOpen(false)} />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <Topbar onOpenNav={() => setNavOpen(true)} />
-          <main className="flex-1 overflow-y-auto px-4 py-6 sm:px-6 md:px-8 md:py-8">
-            <div className="mx-auto w-full max-w-7xl">
-              <Outlet />
-            </div>
-          </main>
-        </div>
+      {/*
+        A column rather than a row now that navigation is horizontal. The
+        sidebar it replaces owned 256 fixed pixels at every width; this gives
+        that back to the content, which on this app is always a wide table or
+        a multi-pane browser.
+
+        The max width goes from 7xl (1280px) to 1600px for the same reason --
+        the constraint existed to stop lines of text running too long beside a
+        sidebar, and without the sidebar the tables can use the room.
+      */}
+      <div className="flex h-screen w-full flex-col overflow-hidden">
+        <TopNav />
+        <main className="flex-1 overflow-y-auto px-4 py-6 sm:px-6 md:px-8 md:py-8">
+          <div className="mx-auto w-full max-w-[1600px]">
+            <Outlet />
+          </div>
+        </main>
 
         <JobsDock />
         <AssistantPanel />
