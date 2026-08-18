@@ -5,9 +5,7 @@ const userRepository = require("../repositories/userRepository");
 const roleRepository = require("../repositories/roleRepository");
 const refreshTokenRepository = require("../repositories/refreshTokenRepository");
 const auditLogRepository = require("../repositories/auditLogRepository");
-const subjectRepository = require("../repositories/subjectRepository");
 const deviceRepository = require("../repositories/deviceRepository");
-const subjectService = require("./subjectService");
 const { hashPassword, verifyPassword } = require("../utils/passwords");
 const {
   signAccessToken,
@@ -58,22 +56,37 @@ async function register({ email, password, fullName }, context = {}) {
   const defaultRole = await roleRepository.findByName("User");
   if (defaultRole) await userRepository.assignRole(user.id, defaultRole.id, null);
 
-  // A new account starts with nothing at all now that subjects are per-user:
-  // no folders to file into, and no device row for the server its storage
-  // locations will live on. Both are created here rather than lazily, so the
-  // very first visit shows a usable Subjects page instead of an empty tree
-  // with a "create your first folder" dead end.
-  //
-  // Neither is allowed to fail the registration. Someone who has an account
-  // but no starter folders can make their own; someone whose account creation
-  // rolled back because a seed folder collided has no account at all, which
-  // is strictly worse. The failure is logged, and both are idempotent enough
-  // to be re-run.
+  /**
+   * A NEW ACCOUNT STARTS WITH NO FOLDERS, DELIBERATELY.
+   *
+   * This used to seed twelve -- Personal/Finance/Administrative/Reference and
+   * some children -- reasoning that "the very first visit shows a usable page
+   * instead of an empty tree with a 'create your first folder' dead end". The
+   * dead end was the real problem; the folders were the wrong fix for it.
+   *
+   * Handing someone a structure invites them to file into it, and it is a
+   * structure derived from nothing: it does not know whether they are filing a
+   * business, a thesis or twenty years of family paperwork. What actually
+   * happened is that the starter folders became the taxonomy by default,
+   * because the cost of rearranging someone else's structure is higher than
+   * the cost of accepting it -- and then documents got forced into the
+   * least-wrong bucket, which is the failure the dynamic tree exists to end.
+   *
+   * So the empty tree stays and the dead end goes: the Library now opens onto
+   * a choice between making a folder and describing the archive to the
+   * assistant, which can build the whole structure in one conversation
+   * (create_subject has been a real action all along). An empty library is an
+   * honest starting point -- nobody has told us anything yet.
+   *
+   * The device row is still created here, because that is infrastructure
+   * rather than a filing decision, and is not allowed to fail the
+   * registration: someone whose account rolled back over a device row has no
+   * account at all, which is strictly worse.
+   */
   try {
-    await subjectRepository.seedStarterTree(user.id, subjectService.slugify);
     await deviceRepository.ensureServerDevice(user.id);
   } catch (err) {
-    console.error(`[auth] Could not seed starter data for ${user.id}:`, err.message);
+    console.error(`[auth] Could not create the server device row for ${user.id}:`, err.message);
   }
 
   await auditLogRepository.record({

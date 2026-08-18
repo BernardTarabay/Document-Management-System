@@ -222,11 +222,38 @@ async function search(query, { filters, limit = 50, offset = 0 } = {}) {
     fileRepository.searchEverything(term, { limit: CANDIDATES_PER_SIGNAL, offset: 0, filters }),
   ]);
 
-  const fused = fuse([
+  const ranked = fuse([
     { name: "semantic", results: semantic.results },
     { name: "description", results: lexical },
     { name: "content", results: existing.map((row) => ({ fileId: row.id, score: Number(row.rank) })) },
   ]);
+
+  /**
+   * THE FILTERS APPLY TO ALL THREE SIGNALS, NOT ONLY THE ONE THAT IS SQL.
+   *
+   * Of the three, only `existing` was built by a query carrying the filter
+   * clauses. The semantic signal scores vectors in memory and the description
+   * signal ranks file_descriptions; both hand back bare ids that no filter has
+   * ever seen. Fusing them let the two unfiltered signals put files back into a
+   * result the user had explicitly narrowed -- a search inside one subject
+   * returned documents filed elsewhere, and a storage-location or date filter
+   * was simply absent from the answer. It looked like the filters being ignored
+   * because that is what it was.
+   *
+   * Gating membership after fusion rather than before keeps the ranking exactly
+   * as RRF computed it, and keeps one definition of what a filter means
+   * (repositories/fileFilters.js) instead of teaching each signal its own.
+   *
+   * Run unconditionally, not only when a filter is set: buildFilterClauses
+   * always emits the owner predicate, and the gate is also what applies
+   * `status <> 'deleted'` to the two id-only signals, neither of which reads a
+   * table that knows a file has been deleted.
+   */
+  const allowed = await fileRepository.idsPassingFilters(
+    ranked.map((hit) => hit.fileId),
+    { filters }
+  );
+  const fused = ranked.filter((hit) => allowed.has(hit.fileId));
 
   const page = fused.slice(offset, offset + limit);
   if (!page.length) return { files: [], semanticUsed: semantic.ran, total: fused.length };

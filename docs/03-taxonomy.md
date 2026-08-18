@@ -56,6 +56,31 @@ Type ("Report") can appear under Finance, Academic, or Administrative. This avoi
 duplicating "Report" as a leaf under every branch and lets naming/classification reason
 about "what kind of thing is this" independently of "whose business area is it."
 
+**How the type is assigned — revised after real-world use.** The rule tier deliberately
+does **not** read document type out of the body text, and this asymmetry with Subject is
+the point rather than an oversight. Subject asks *what is this about*, which prose
+answers honestly. Document type asks *what kind of thing is this*, which prose does not
+answer at all: the file that exposed this says "presentation" four times, every one of
+them about a person giving one, and a novel matched type "Book" on the substrings inside
+"playbook" and "fantasy books". No lexical rule separates "mentions a presentation" from
+"is a presentation". So the rule tier reads only two signals — the filename a person
+chose, and an extension that settles the question outright (`.pptx` **is** a slide deck;
+`.pdf` and `.docx` are containers and imply nothing, and spreadsheets are deliberately
+unmapped because the seeded type is the narrower "Spreadsheet Model"). Everything else
+comes from the AI tier, which actually reads the document, or from a human setting it on
+the Files page. The rule tier assigning *no* type is the expected outcome on a
+French/Arabic corpus with an English seed list, and is preferred to a confident wrong one.
+
+**Orthogonal axes must be independently writable.** Both axes live on one
+`classification_results` row and every reader resolves a file's classification as the
+*latest* row, so a writer that touched one axis and passed `null` for the other was not
+adding information — it was deleting the other axis. Filing a document under a Subject
+erased its Document Type; setting a Document Type dropped its Subject. Writers that
+speak to only one axis now go through `classificationResultRepository.createPartial`,
+where `undefined` means "keep what is there" and `null` still means "clear this".
+Every row is therefore a complete snapshot, which is what "latest row wins" already
+assumed everywhere downstream.
+
 ## 3.5 Tags
 
 Tags are the escape hatch for anything that doesn't belong in the hierarchy or the

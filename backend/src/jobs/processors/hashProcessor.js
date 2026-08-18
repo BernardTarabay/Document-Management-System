@@ -10,14 +10,15 @@ const storageLocationRepository = require("../../repositories/storageLocationRep
 const auditLogRepository = require("../../repositories/auditLogRepository");
 const { getStorageServiceFor } = require("../../services/storage/storageService");
 const knownContentService = require("../../services/knownContentService");
-const { sha256Stream } = require("../../services/hashingService");
+const quickIdentityService = require("../../services/quickIdentityService");
+const { sha256Stream, sha256AndFingerprint } = require("../../services/hashingService");
 const { enqueueJob } = require("../../queues");
 const imageDetection = require("../../services/imageDetection");
 const pipelineState = require("../../services/pipelineState");
 const ocrEngine = require("../../services/ocr/ocrEngine");
 const { JobType, OcrStatus } = require("../../models/enums");
 
-async function handle({ fileId }) {
+async function handle({ fileId, forceFullHash = false }) {
   const file = await fileRepository.findById(fileId);
   if (!file || file.status === "deleted" || file.status === "missing") {
     return { skipped: true, reason: "file not active" };
@@ -53,10 +54,81 @@ async function handle({ fileId }) {
     }
   }
 
-  const hash = await sha256Stream(storageService.readStream(file.current_path));
+  /**
+   * RECOGNISE IT BEFORE READING IT.
+   *
+   * The known-content short-circuit below already makes an identical file's
+   * downstream work free -- but it fires on the sha256, and reaching the sha256
+   * means streaming every byte. On an import that is mostly overlapping copies,
+   * which is the normal shape here, that read IS the cost of the import.
+   *
+   * So this asks the cheap question first: is there already a file with this
+   * exact size and mtime? That is answered from an index with nothing opened,
+   * and for a genuinely new file the answer is no and this costs one query. If
+   * there IS a candidate, 64 KB from each end is enough to decide -- 128 KB
+   * instead of 500 MB on a video.
+   *
+   * A match adopts the twin's sha256 rather than computing it. That is an
+   * inference, and it is recorded as one (`hash_source = 'inferred'`) rather
+   * than written silently into the column duplicate detection is built on.
+   * `forceFullHash` in the payload bypasses all of this, which is how
+   * scripts/verify-inferred-hashes.js turns a believed hash into a proven one.
+   */
+  let hash = null;
+  let hashSource = "computed";
+  let quickFingerprint = null;
+
+  if (!forceFullHash) {
+    const quick = await quickIdentityService
+      .findTwinWithoutFullRead(file, storageService, { accessMode: storageLocation.access_mode })
+      .catch(() => null); // a sampling failure must never block a real hash
+    if (quick) {
+      quickFingerprint = quick.fingerprint;
+      if (quick.twin?.sha256_hash) {
+        hash = quick.twin.sha256_hash;
+        hashSource = "inferred";
+        await auditLogRepository.record({
+          action: "file.hash_inferred",
+          entityType: "file",
+          entityId: fileId,
+          newState: { sha256Hash: hash, matchedFileId: quick.twin.id, fingerprint: quick.fingerprint },
+          reason:
+            `Identified from ${quickIdentityService.CHUNK_BYTES * 2} bytes rather than reading all ` +
+            `${file.size_bytes} -- same size, same timestamp, same head and tail as an already-indexed file. ` +
+            "Marked inferred; scripts/verify-inferred-hashes.js can confirm it.",
+        });
+      }
+    }
+  }
+
+  if (hash === null) {
+    /**
+     * The full read, which also produces the fingerprint for free.
+     *
+     * THE FINGERPRINT IS STORED WHETHER OR NOT IT WAS NEEDED THIS TIME, and
+     * that is the whole mechanism: this file is the twin that the NEXT
+     * overlapping folder matches against. The first version only computed one
+     * when a candidate already existed, which meant the original never stored
+     * one, so no copy ever had anything to match, so the shortcut never fired
+     * for anyone -- a feature that was exactly as fast as not having it.
+     */
+    const wantFingerprint = Number(file.size_bytes) >= quickIdentityService.MIN_SIZE_FOR_INFERENCE;
+    const result = await sha256AndFingerprint(storageService.readStream(file.current_path), {
+      sizeBytes: file.size_bytes,
+      chunkBytes: quickIdentityService.CHUNK_BYTES,
+      wantFingerprint,
+    });
+    hash = result.sha256;
+    if (result.fingerprint) quickFingerprint = result.fingerprint;
+  }
 
   await fileRepository.updateHash(fileId, hash);
   await fileHashRepository.upsert(fileId, "sha256", hash);
+  // Stored whether it matched or not: a file that is nobody's twin today is
+  // the twin the NEXT overlapping folder matches against, and the 128 KB has
+  // already been read by this point.
+  if (quickFingerprint) await quickIdentityService.setFingerprint(fileId, quickFingerprint);
+  await quickIdentityService.setHashSource(fileId, hashSource);
   if (file.status === "changed") {
     await fileRepository.updateStatus(fileId, "active");
   }

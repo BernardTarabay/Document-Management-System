@@ -1,8 +1,30 @@
 const subjectService = require("../services/subjectService");
 const fileRepository = require("../repositories/fileRepository");
+const fileDescriptionRepository = require("../repositories/fileDescriptionRepository");
 const triageRepository = require("../repositories/triageRepository");
+const descriptionSearchService = require("../services/descriptionSearchService");
+const { parseFileFilters } = require("../repositories/fileFilters");
 const geminiChatService = require("../services/ai/geminiChatService");
 const { ValidationError } = require("../validators/validationError");
+
+/**
+ * How many search hits to put in front of the model.
+ *
+ * Enough that a real question is answerable, small enough that retrieval never
+ * crowds out the page context and the backlog -- those say what the user is
+ * LOOKING at, which the search cannot know.
+ */
+const RETRIEVED_FILE_LIMIT = 30;
+
+/** Descriptions are prose and the prompt is shared; one sentence is the useful part. */
+const MAX_DESCRIPTION_CHARS = 220;
+
+function trimDescription(text) {
+  if (!text) return null;
+  const clean = String(text).replace(/\s+/g, " ").trim();
+  if (clean.length <= MAX_DESCRIPTION_CHARS) return clean;
+  return `${clean.slice(0, MAX_DESCRIPTION_CHARS - 1).trimEnd()}…`;
+}
 
 /**
  * The subject tree is always fetched fresh from the DB here rather than
@@ -50,11 +72,49 @@ async function chat(req, res) {
   const describe = (f) => ({
     id: f.id,
     filename: f.canonical_filename || f.filename_current,
-    path: f.current_path,
+    // `currentPath`, not `path`. The prompt builder reads `f.currentPath`
+    // (geminiChatService.buildInput), so a key named `path` rendered as an
+    // empty string on every line -- the location was computed here, carried
+    // all the way to the template, and silently dropped. Same for the subject,
+    // which was never read at all.
+    currentPath: f.current_path || null,
     subjectName: f.subject_name || null,
   });
 
   const visibleFiles = ownedFiles.map(describe);
+
+  /**
+   * WHAT THE USER IS ASKING ABOUT, NOT ONLY WHAT THEY ARE LOOKING AT.
+   *
+   * The assistant had no retrieval step at all. Its entire world was the page
+   * context plus the backlog below -- at most a couple of hundred files out of
+   * thousands -- and each one reached the model as a bare filename. So asking
+   * for "the photo of two people hugging in a kitchen" failed while asking for
+   * "WhatsApp Image 2026-07-29" succeeded, and the difference was not search
+   * quality: the description was never sent, and the file was usually not in
+   * the context in the first place. The only string the model could match on
+   * was the filename.
+   *
+   * The archive already knows how to answer that question --
+   * descriptionSearchService fuses meaning, description wording and
+   * content/filename, and it finds both of those files from a paraphrase. It
+   * simply was never wired to the assistant. This is that wire.
+   *
+   * Failure is non-fatal on purpose. If the embedding call cannot be made (no
+   * key, daily cap reached) the semantic half reports `ran: false` and the
+   * lexical description half still runs, so retrieval degrades to keyword
+   * matching over descriptions rather than disappearing. A search that throws
+   * outright must not take the conversation down with it -- the assistant is
+   * still useful with only the page in front of it, which is what it had
+   * before this existed.
+   */
+  const retrievedFiles = await descriptionSearchService
+    .search(String(message).trim(), {
+      filters: parseFileFilters({}, req.user.id),
+      limit: RETRIEVED_FILE_LIMIT,
+    })
+    .then((r) => r.files.map((f) => ({ ...describe(f), foundBy: "search" })))
+    .catch(() => []);
 
   /**
    * THE UNFILED BACKLOG, ALWAYS IN SCOPE.
@@ -81,21 +141,79 @@ async function chat(req, res) {
     fileRepository.listPhotos(req.user.id, { limit: 60, offset: 0 }).catch(() => []),
   ]);
 
-  const seen = new Set(visibleFiles.map((f) => f.id));
-  const backlog = [];
+  /**
+   * ONE ENTRY PER FILE, IN PRIORITY ORDER, MERGING RATHER THAN DROPPING.
+   *
+   * Three sources overlap heavily -- an unfiled photo the user is looking at
+   * and just searched for is in all three -- and the model treats a repeated
+   * id as two documents and proposes two moves for it. So this collapses by
+   * id, keeping the FIRST position and folding in any extra field a later
+   * source knows about.
+   *
+   * Order is the whole point, because buildInput trims to MAX_VISIBLE_FILES
+   * from the end. Retrieval leads: it is the only bucket chosen for relevance
+   * to what was actually asked, and a trim that reached it would put the
+   * assistant back where it started.
+   *
+   * Deduping in the other direction is the bug this replaced. Filtering the
+   * retrieved list against a `seen` set already primed from the backlog looked
+   * equivalent and was not: every unfiled photo is in the backlog, so the top
+   * search hit for "people hugging in a kitchen" was demoted out of the
+   * retrieval block and re-listed in backlog order, below screenshots of
+   * cryptography diagrams. Position IS the signal here -- dropping a file from
+   * the front of the list is not deduplication, it is a re-ranking.
+   */
+  const byId = new Map();
+  const add = (file, extra = {}) => {
+    const existing = byId.get(file.id);
+    if (!existing) {
+      byId.set(file.id, { ...file, ...extra });
+      return;
+    }
+    // Keep the earlier (higher-priority) entry and its position; fill in only
+    // the fields it does not already have. Written as an explicit loop rather
+    // than Object.assign: the spread that reads correctly left-to-right is the
+    // one where the LATER source wins, which is the opposite of what is wanted
+    // here, and `Object.assign(existing, extra, existing)` does not fix it --
+    // once `extra` has been copied in, the third argument is copying `existing`
+    // onto itself and changes nothing.
+    for (const [key, value] of Object.entries(extra)) {
+      if (existing[key] === undefined || existing[key] === null) existing[key] = value;
+    }
+  };
+
+  for (const file of retrievedFiles) add(file);
+  for (const file of visibleFiles) add(file);
   for (const row of [...triageRows, ...photoRows]) {
-    if (seen.has(row.id)) continue;
-    seen.add(row.id);
-    backlog.push({
-      ...describe(row),
+    add(describe(row), {
       // Says WHY it is waiting, so the model can explain its choice rather
       // than filing blind -- "this one is a photo with no readable text" is a
-      // better basis for a suggestion than a bare filename.
+      // better basis for a suggestion than a bare filename. Merged onto a file
+      // that was already retrieved, rather than being the reason it is absent.
       waitingBecause: row.reason || (row.is_image ? "a photo awaiting review" : "unfiled"),
     });
   }
 
-  const selectableFiles = [...visibleFiles, ...backlog];
+  const selectableFiles = [...byId.values()];
+
+  /**
+   * THE DESCRIPTION IS THE POINT.
+   *
+   * Every active file ends up with one (services/descriptionService), and it
+   * is the only field that says what a document actually IS -- a filename like
+   * "WhatsApp Image 2026-07-29 at 20.17.33.jpeg" says nothing at all, and that
+   * is most of this archive. Fetched in one query for the whole set rather
+   * than per file, and attached here rather than inside `describe` because the
+   * rows arrive from four different queries, none of which carries it.
+   */
+  const descriptions = await fileDescriptionRepository
+    .descriptionsForFiles(selectableFiles.map((f) => f.id), req.user.id)
+    .catch(() => new Map());
+
+  for (const file of selectableFiles) {
+    const description = trimDescription(descriptions.get(file.id));
+    if (description) file.description = description;
+  }
 
   const result = await geminiChatService.chat({
     message,

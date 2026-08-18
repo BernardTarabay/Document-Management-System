@@ -14,12 +14,48 @@ router.get("/", requirePermission("document.view"), asyncHandler(controller.list
 // never-registered GET /files/search and silently swallowing the 400.)
 router.get("/count", requirePermission("document.view"), asyncHandler(controller.count));
 router.get("/filter-options", requirePermission("document.view"), asyncHandler(controller.filterOptions));
+// Ids only, for "select all N". Before "/:id" like its neighbours.
+router.get("/ids", requirePermission("document.view"), asyncHandler(controller.matchingIds));
 router.delete("/remove-all", requirePermission("document.delete"), asyncHandler(controller.removeAll));
 // Read-only similarity check between any two files. Registered before
 // "/:id" so "compare" is never swallowed as a file id. Only reveals how
 // alike two files the user can already view are, so document.view is the
 // right bar.
 router.post("/compare", requirePermission("document.view"), asyncHandler(controller.compare));
+// Filing a selection under a subject, from the Library. Registered before
+// "/:id" for the same reason as the routes above. `document.move` matches
+// POST /photos/move and POST /triage/move, which reach the identical
+// operation (fileOrganizeService.moveManyToSubject) from a different list --
+// the same action must not need a different permission depending on which
+// page you happened to start from.
+router.post("/move", requirePermission("document.move"), asyncHandler(controller.moveMany));
+// The same operation, reached by criteria instead of by a list of ids. Same
+// permission for the same reason: it is the identical act of filing, and which
+// page you started from must not change what you are allowed to do. Registered
+// before "/:id" like its neighbours.
+router.post("/move-by-filter", requirePermission("document.move"), asyncHandler(controller.moveByFilter));
+// --- Archive and Trash ---------------------------------------------------
+//
+// Before "/:id" like every other literal segment here, or "lifecycle" would be
+// read as a file id and fail the uuid cast.
+//
+// Moving something to Archive or Trash needs document.delete, not
+// document.move: filing a document somewhere and putting it away are different
+// acts, and the second is the one that makes it disappear from every listing.
+// EVERY LITERAL SEGMENT COMES BEFORE ":destination", not just before "/:id".
+//
+// Got this wrong once already: with POST "/lifecycle/:destination" registered
+// first, POST "/lifecycle/purge" was matched by it and answered
+// `Unknown destination "purge"` -- the irreversible route was unreachable and
+// failed as a validation error, which looks like a bad request rather than a
+// missing route. Same rule as "/compare" and "/move" above.
+router.get("/lifecycle/summary", requirePermission("document.view"), asyncHandler(controller.lifecycleSummary));
+router.post("/lifecycle/restore", requirePermission("document.move"), asyncHandler(controller.lifecycleRestore));
+// The only irreversible route in the application. Two-step: see the controller.
+router.post("/lifecycle/purge", requirePermission("document.delete"), asyncHandler(controller.lifecyclePurge));
+router.get("/lifecycle/:destination", requirePermission("document.view"), asyncHandler(controller.lifecycleList));
+router.post("/lifecycle/:destination", requirePermission("document.delete"), asyncHandler(controller.lifecycleMove));
+
 router.get("/:id", requirePermission("document.view"), asyncHandler(controller.getOne));
 router.get("/:id/download", requirePermission("document.download"), asyncHandler(controller.download));
 // Preview streams the same bytes as download (mime-whitelisted, inline) --

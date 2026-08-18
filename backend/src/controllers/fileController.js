@@ -1,4 +1,5 @@
 const fileService = require("../services/fileService");
+const lifecycleService = require("../services/lifecycleService");
 const mime = require("../utils/mimeGuess");
 const { buildContentDisposition } = require("../utils/contentDisposition");
 
@@ -17,6 +18,22 @@ async function list(req, res) {
 
 async function count(req, res) {
   res.json(await fileService.count(req.query, req.user.id));
+}
+
+/**
+ * Every id matching the current filters, for "select all N".
+ *
+ * Ids only, never rows: the caller already has the page it is showing and
+ * needs the rest as a selection, not as data. `capped` travels with them so
+ * the UI can say "the first 5,000 of 12,400" instead of quietly presenting a
+ * truncated set as the whole match.
+ */
+async function matchingIds(req, res) {
+  res.json(
+    await fileService.matchingIds(req.query, req.user.id, {
+      subjectId: req.query.inSubjectId || null,
+    })
+  );
 }
 
 async function filterOptions(req, res) {
@@ -112,6 +129,91 @@ async function update(req, res) {
   res.status(result?.requiresConfirmation ? 409 : 200).json(result);
 }
 
+/**
+ * File a selection under one subject.
+ *
+ * Same request/response contract as POST /photos/move and POST /triage/move,
+ * deliberately: they are the same operation reached from a different list, and
+ * MoveManyModal is already written against that shape. 409 when at least one
+ * file raised a duplicate question, carrying the findings so the UI can ask
+ * once about the whole batch rather than once per file.
+ */
+async function moveMany(req, res) {
+  const { fileIds, subjectId, confirmDuplicates } = req.body || {};
+  const result = await fileService.moveMany(fileIds, subjectId, req.user.id, {
+    confirmDuplicates: Boolean(confirmDuplicates),
+  });
+  res.status(result.needsConfirmation.length > 0 ? 409 : 200).json(result);
+}
+
+/**
+ * File everything matching a filter under one subject.
+ *
+ * The filter arrives in the BODY rather than the query string, and in the same
+ * shape GET /files takes it: `{ filters: { ext, dateFrom, dateTo, subjectId,
+ * documentTypeId, storageLocationId, pathPrefix }, toSubjectId }`. One filter
+ * vocabulary across the filter bar, the listing, the counts and this -- a
+ * second one would drift, and the assistant would be speaking a dialect of the
+ * UI's language rather than the language itself.
+ *
+ * 202, not 200: the reply is a job to watch, not a completed move.
+ */
+async function moveByFilter(req, res) {
+  const { filters, toSubjectId, confirmDuplicates } = req.body || {};
+  const result = await fileService.moveByFilter(filters, toSubjectId, req.user.id, {
+    confirmDuplicates: Boolean(confirmDuplicates),
+  });
+  res.status(202).json(result);
+}
+
+/**
+ * Archive and Trash: what is in them, and moving things in and out.
+ *
+ * These sit on the file controller rather than getting their own resource
+ * because they are states of a FILE, not a collection that owns anything --
+ * the same reason they are statuses rather than folders (migration 037).
+ */
+async function lifecycleList(req, res) {
+  res.json(await lifecycleService.listDestination(req.params.destination, req.query, req.user.id));
+}
+
+async function lifecycleSummary(req, res) {
+  res.json(await lifecycleService.summary(req.user.id));
+}
+
+/** Move files INTO Archive or Trash. */
+async function lifecycleMove(req, res) {
+  const { fileIds } = req.body || {};
+  res.json(await lifecycleService.moveFiles(fileIds, req.params.destination, req.user.id));
+}
+
+/** Bring them back out, to `active` and their existing folder. */
+async function lifecycleRestore(req, res) {
+  const { fileIds } = req.body || {};
+  res.json(await lifecycleService.restoreFiles(fileIds, req.user.id));
+}
+
+/**
+ * Remove rows for good.
+ *
+ * TWO-STEP, and the second step is not a formality. `confirm: "permanently
+ * delete"` has to be typed by the caller, so a mis-wired button or a stray
+ * click cannot reach it -- this is the only operation in the application that
+ * cannot be undone. The route is also restricted to files ALREADY in the
+ * Trash (see lifecycleService.purgeFiles), so every permanent deletion has a
+ * reversible step in front of it.
+ */
+async function lifecyclePurge(req, res) {
+  const { fileIds, confirm } = req.body || {};
+  if (String(confirm || "").trim().toLowerCase() !== "permanently delete") {
+    return res.status(400).json({
+      error: 'This cannot be undone. Send confirm: "permanently delete" to proceed.',
+      requiresConfirmation: true,
+    });
+  }
+  res.json(await lifecycleService.purgeFiles(fileIds, req.user.id));
+}
+
 async function reveal(req, res) {
   res.json(await fileService.revealInFileManager(req.params.id, req.user.id));
 }
@@ -122,5 +224,8 @@ async function compare(req, res) {
 }
 
 module.exports = {
-  list, count, filterOptions, getOne, download, preview, remove, removeAll, compare, update, reveal,
+  list, count, filterOptions, matchingIds, getOne, download, preview, remove, removeAll, compare, update, reveal,
+  moveMany,
+  moveByFilter,
+  lifecycleList, lifecycleSummary, lifecycleMove, lifecycleRestore, lifecyclePurge,
 };

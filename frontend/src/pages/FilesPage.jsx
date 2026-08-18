@@ -133,6 +133,10 @@ export function FilesPage() {
   // list stays in step with what the rest of the page is showing.
   const { data: subjects } = useApiData(() => api.get("/subjects"), []);
 
+  // The other classification axis (docs/03-taxonomy.md §3.4). Plain list, not
+  // /browse: this is a dropdown's options, and it does not need counts.
+  const { data: documentTypes } = useApiData(() => api.get("/document-types"), []);
+
   // Serialized into the dependency list because it is an object -- a new
   // identity every render would refetch forever.
   const filterParams = filtersToParams(filters);
@@ -341,6 +345,7 @@ export function FilesPage() {
         value={filters}
         onChange={(next) => { setFilters(next); setOffset(0); }}
         subjects={subjects}
+        documentTypes={documentTypes}
         resultCount={countData?.count ?? null}
         totalCount={totalData?.count ?? null}
       />

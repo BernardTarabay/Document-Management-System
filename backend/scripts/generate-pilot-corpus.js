@@ -43,6 +43,26 @@ const OUT = argOf("out", path.join(process.env.LOCALAPPDATA, "AtlasPilotCorpus")
 const SEED = argOf("seed", path.join(process.env.USERPROFILE, "OneDrive", "Desktop", "test"));
 const CLEAN = args.includes("--clean");
 
+/**
+ * --subjects N: build a large FOLDER TREE in the database, and nothing else.
+ *
+ * A separate job from generating files, sharing this script because it answers
+ * the same question -- "does this hold up at the size the client actually
+ * has?" -- for the other half of the Library. The file generator above
+ * measures the pipeline; this measures the folder pane, which is what falls
+ * over first: a recursive tree mounted a React node per visible folder, so the
+ * page became unusable long before the pipeline did.
+ *
+ *   node scripts/generate-pilot-corpus.js --subjects 55000
+ *   node scripts/generate-pilot-corpus.js --subjects 0        (removes them)
+ *
+ * Everything it creates is named with a prefix and removed by passing 0, so it
+ * cannot be confused with, or delete, folders a person made.
+ */
+const SUBJECTS = args.includes("--subjects") ? parseInt(argOf("subjects", "55000"), 10) : null;
+const SUBJECT_DEPTH = parseInt(argOf("subject-depth", "5"), 10);
+const SUBJECT_PREFIX = "[pilot]";
+
 // Deterministic PRNG: a pilot you can re-run and get the same corpus from is
 // worth more than a novel one every time, because then a timing difference
 // means the code changed rather than the input did.
@@ -280,7 +300,92 @@ async function loadSeeds() {
   return out;
 }
 
+/**
+ * Folder names a real archive contains: accented French, Arabic, and the kind
+ * of thing people actually invent. A vocabulary of unique ASCII words would
+ * make the pane's search look faster than it is, since the cost is in how many
+ * names a term matches.
+ */
+const FOLDER_WORDS = [
+  "Factures", "Contrats", "Comptabilité", "Rapports", "Procès-verbaux",
+  "مراسلات", "تقارير", "فواتير",
+  "Tables", "Boat stuff", "Scans", "Inbox", "Divers", "Archive", "Photos",
+  "2019", "2020 - Q3 - reconciled", "Old NAS", "À classer",
+];
+
+async function generateSubjects(count) {
+  // Required lazily: the file generator above must keep working on a machine
+  // with no database configured.
+  require("dotenv").config();
+  const { Pool } = require("pg");
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+  try {
+    const owner = (await pool.query("SELECT id FROM users ORDER BY created_at LIMIT 1")).rows[0];
+    if (!owner) { console.error("No user to own the folders. Seed the database first."); process.exit(1); }
+
+    const existing = await pool.query(
+      "SELECT count(*)::int AS n FROM subjects WHERE owner_user_id=$1 AND name LIKE $2",
+      [owner.id, `${SUBJECT_PREFIX}%`]
+    );
+    if (existing.rows[0].n) {
+      process.stdout.write(`Removing ${existing.rows[0].n.toLocaleString()} existing pilot folders... `);
+      // Children first: the tree has a self-referencing FK.
+      await pool.query(
+        `DELETE FROM subjects WHERE owner_user_id=$1 AND name LIKE $2`,
+        [owner.id, `${SUBJECT_PREFIX}%`]
+      );
+      console.log("done");
+    }
+    if (!count) return;
+
+    const started = Date.now();
+    // Inserted level by level so every parent exists before its children, and
+    // in batches because 55,000 single-row INSERTs is minutes of round trips.
+    const ROOTS = Math.max(8, Math.round(count / 2500));
+    let created = 0;
+    let previousLevel = [];
+
+    for (let depth = 0; depth < SUBJECT_DEPTH && created < count; depth += 1) {
+      const remaining = count - created;
+      const wanted = depth === 0
+        ? Math.min(ROOTS, remaining)
+        : Math.min(remaining, Math.ceil(count / SUBJECT_DEPTH) + depth * 200);
+
+      const values = [];
+      const params = [];
+      for (let i = 0; i < wanted; i += 1) {
+        const parent = depth === 0 ? null : previousLevel[i % previousLevel.length];
+        const name = `${SUBJECT_PREFIX} ${FOLDER_WORDS[(created + i) % FOLDER_WORDS.length]} ${created + i}`;
+        const slug = `pilot-${created + i}`;
+        const base = params.length;
+        params.push(owner.id, parent, name, slug);
+        values.push(`($${base + 1}, $${base + 2}, 'subject', $${base + 3}, $${base + 4}, '')`);
+      }
+      const { rows } = await pool.query(
+        `INSERT INTO subjects (owner_user_id, parent_id, level, name, slug, materialized_path)
+         VALUES ${values.join(",")} RETURNING id`,
+        params
+      );
+      previousLevel = rows.map((r) => r.id);
+      created += rows.length;
+      process.stdout.write(`  depth ${depth}: ${rows.length.toLocaleString()} folders (${created.toLocaleString()} total)
+`);
+    }
+
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(`
+Created ${created.toLocaleString()} folders in ${secs}s.`);
+    console.log("Open the Library to profile the folder pane against them.");
+    console.log(`Remove them with: node scripts/generate-pilot-corpus.js --subjects 0`);
+  } finally {
+    await pool.end();
+  }
+}
+
 (async () => {
+  if (SUBJECTS !== null) { await generateSubjects(SUBJECTS); return; }
+
   if (CLEAN) {
     if (fs.existsSync(OUT)) { await fsp.rm(OUT, { recursive: true, force: true }); console.log(`Removed ${OUT}`); }
     else console.log(`Nothing at ${OUT}`);

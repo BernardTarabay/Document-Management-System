@@ -95,6 +95,10 @@ async function fakeJob(fileId, { jobType, status, finishedMinutesAgo = null, err
   for (const n of NAMES) await fsp.writeFile(path.join(root, n), "x".repeat(2048));
 
   const admin = (await p.query("SELECT id FROM users ORDER BY created_at LIMIT 1")).rows[0];
+  // Every read below is owner-scoped (repositories/ownership.js): the owner is
+  // a required argument, not an optional narrowing, so a fixture that omits it
+  // throws rather than quietly reading the whole instance.
+  const ownerId = admin.id;
   const loc = await storageLocationService.create(
     { name: "Triage Test", type: "local", rootPath: root, accessMode: "direct" }, admin.id);
   locId = loc.id;
@@ -174,7 +178,7 @@ async function fakeJob(fileId, { jobType, status, finishedMinutesAgo = null, err
 
   console.log("\nreading the triage queue:\n");
 
-  const rows = await triageRepository.list({ limit: 200 });
+  const rows = await triageRepository.list(ownerId, { limit: 200 });
   const mine = rows.filter((r) => r.storage_location_id === locId);
   const reasonOf = Object.fromEntries(mine.map((r) => [r.filename_current, r.reason]));
 
@@ -214,13 +218,13 @@ async function fakeJob(fileId, { jobType, status, finishedMinutesAgo = null, err
     severity.every((r, i) => i === 0 || rank.indexOf(severity[i - 1]) <= rank.indexOf(r)),
     severity.join(" > "));
 
-  const stalledOnly = (await triageRepository.list({ reason: "stalled", limit: 200 }))
+  const stalledOnly = (await triageRepository.list(ownerId, { reason: "stalled", limit: 200 }))
     .filter((r) => r.storage_location_id === locId);
   check("?reason=stalled returns only stalled files",
     stalledOnly.length === 2 && stalledOnly.every((r) => r.reason === "stalled"),
     `${stalledOnly.length} rows`);
 
-  const counts = await triageRepository.countByReason();
+  const counts = await triageRepository.countByReason(ownerId);
   check("the summary counts agree with the rows themselves",
     Object.entries(EXPECTED).every(([, reason]) =>
       (counts.byReason[reason] || 0) >= mine.filter((r) => r.reason === reason).length),
@@ -228,7 +232,7 @@ async function fakeJob(fileId, { jobType, status, finishedMinutesAgo = null, err
   check("the in-flight count sees the queued file", counts.inFlight >= 1, `${counts.inFlight}`);
 
   let rejected = null;
-  try { await triageService.list({ reason: "made_up" }); }
+  try { await triageService.list({ reason: "made_up" }, ownerId); }
   catch (err) { rejected = err.message; }
   check("an unknown ?reason= is rejected rather than silently ignored",
     Boolean(rejected) && /Unknown triage reason/.test(rejected || ""), rejected || "(accepted!)");
@@ -265,7 +269,7 @@ async function fakeJob(fileId, { jobType, status, finishedMinutesAgo = null, err
 
   // Retried files must LEAVE the queue -- otherwise pressing retry looks
   // like it did nothing, which is how you end up pressing it forty times.
-  const after = (await triageRepository.list({ limit: 200 }))
+  const after = (await triageRepository.list(ownerId, { limit: 200 }))
     .filter((r) => r.storage_location_id === locId)
     .map((r) => r.filename_current);
   check("a retried file drops out of the queue while its job is in flight",

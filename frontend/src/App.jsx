@@ -9,7 +9,8 @@ import { RegisterPage } from "./pages/RegisterPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { FilesPage } from "./pages/FilesPage";
 import { DocumentsPage } from "./pages/DocumentsPage";
-import { SubjectsPage } from "./pages/SubjectsPage";
+import { LibraryPage } from "./pages/LibraryPage";
+import { DocumentTypesPage } from "./pages/DocumentTypesPage";
 import { DuplicateGroupsPage } from "./pages/DuplicateGroupsPage";
 import { RenameProposalsPage } from "./pages/RenameProposalsPage";
 import { ProcessingJobsPage } from "./pages/ProcessingJobsPage";
@@ -31,10 +32,26 @@ function App() {
 
           <Route element={<ProtectedRoute />}>
             <Route element={<Layout />}>
-              <Route path="/" element={<DashboardPage />} />
+              {/*
+                THE LIBRARY IS THE FRONT DOOR, not the dashboard.
+
+                This is a document management system: the thing a person opens
+                it to do is look at their documents, organized. A dashboard of
+                pipeline counters is genuinely useful — it is how you find out
+                that 900 files are stuck — but it answers a question you ask
+                occasionally, not the one you come here with. It keeps its own
+                route and stays in the navigation; it just is not what greets
+                you any more.
+              */}
+              <Route path="/" element={<LibraryPage />} />
+              <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/files" element={<FilesPage />} />
               <Route path="/documents" element={<DocumentsPage />} />
-              <Route path="/subjects" element={<SubjectsPage />} />
+              {/* The old address, kept working. Anyone who bookmarked
+                  /subjects or has it in their history lands where that page
+                  went rather than on the not-found redirect. */}
+              <Route path="/subjects" element={<Navigate to="/" replace />} />
+              <Route path="/document-types" element={<DocumentTypesPage />} />
               <Route path="/duplicates" element={<DuplicateGroupsPage />} />
               <Route path="/rename-proposals" element={<RenameProposalsPage />} />
               <Route path="/triage" element={<TriagePage />} />

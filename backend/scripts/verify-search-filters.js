@@ -101,18 +101,25 @@ const sameSet = (rows, expected) =>
   for (const f of FIXTURES) await fsp.writeFile(path.join(root, f.file), "x".repeat(1024));
 
   const admin = (await p.query("SELECT id FROM users ORDER BY created_at LIMIT 1")).rows[0];
+  // Every read below is owner-scoped (repositories/ownership.js): the owner is
+  // a required argument, not an optional narrowing, so a fixture that omits it
+  // throws rather than quietly reading the whole instance.
+  const ownerId = admin.id;
   const loc = await storageLocationService.create(
-    { name: "Filter Test", type: "local", rootPath: root, accessMode: "direct" }, admin.id);
+    { name: "Filter Test", type: "local", rootPath: root, accessMode: "direct" }, ownerId);
   locId = loc.id;
   await scanProcessor.handle({ storageLocationId: locId });
   await dequeueFixtureJobs(p, locId);
 
+  // `level` is not passed: the migration-029 trigger derives it and
+  // materialized_path from the parent, so there is one place that decides
+  // where a row sits in the tree.
   const parent = await subjectRepository.create({
-    parentId: null, level: "subject", name: "FilterTest Parent", slug: "filtertest-parent", description: null,
+    ownerUserId: ownerId, parentId: null, name: "FilterTest Parent", slug: "filtertest-parent", description: null,
   });
   subjectIds.push(parent.id);
   const child = await subjectRepository.create({
-    parentId: parent.id, level: "category", name: "FilterTest Child", slug: "filtertest-child", description: null,
+    ownerUserId: ownerId, parentId: parent.id, name: "FilterTest Child", slug: "filtertest-child", description: null,
   });
   subjectIds.push(child.id);
   const subjectOf = { parent: parent.id, child: child.id };
@@ -141,9 +148,9 @@ const sameSet = (rows, expected) =>
   // Everything below scopes to this location so the surrounding repository
   // (9k real files) cannot make a check pass or fail by accident.
   const listed = (extra = {}) =>
-    fileService.search({ storageLocationId: locId, limit: 100, ...extra });
+    fileService.search({ storageLocationId: locId, limit: 100, ...extra }, ownerId);
   const counted = (extra = {}) =>
-    fileService.count({ storageLocationId: locId, ...extra });
+    fileService.count({ storageLocationId: locId, ...extra }, ownerId);
 
   // --- the listing path (no search term) ----------------------------------
 
@@ -233,20 +240,20 @@ const sameSet = (rows, expected) =>
 
   console.log("\ninside a subject, and the tree:\n");
 
-  const inChild = await subjectService.getDocumentsForSubject(child.id, { limit: 100 });
+  const inChild = await subjectService.getDocumentsForSubject(child.id, { limit: 100 }, ownerId);
   check("browsing a subject lists its own files",
     sameSet(inChild, ["rapport-2019.pdf", "lettre-2019.doc", "undated.pdf"]), names(inChild).join(", "));
 
-  const inChildPdf = await subjectService.getDocumentsForSubject(child.id, { limit: 100, ext: "pdf" });
+  const inChildPdf = await subjectService.getDocumentsForSubject(child.id, { limit: 100, ext: "pdf" }, ownerId);
   check("filters narrow WITHIN the subject you have open",
     sameSet(inChildPdf, ["rapport-2019.pdf", "undated.pdf"]), names(inChildPdf).join(", "));
 
-  const inChildSearch = await subjectService.getDocumentsForSubject(child.id, { limit: 100, q: "lettre", ext: "pdf" });
+  const inChildSearch = await subjectService.getDocumentsForSubject(child.id, { limit: 100, q: "lettre", ext: "pdf" }, ownerId);
   check("searching inside a subject respects the filter as well",
     inChildSearch.length === 0, names(inChildSearch).join(", ") || "(none, correctly)");
 
-  const treeAll = await subjectService.list({});
-  const treePdf = await subjectService.list({ ext: "pdf" });
+  const treeAll = await subjectService.list({}, ownerId);
+  const treePdf = await subjectService.list({ ext: "pdf" }, ownerId);
   const nodeOf = (list, id) => list.find((s) => s.id === id);
 
   check("unfiltered, the tree rolls child counts up into the parent",
@@ -259,7 +266,7 @@ const sameSet = (rows, expected) =>
 
   check("a tree node's count equals the number of files listing it returns",
     nodeOf(treePdf, child.id).fileCount ===
-      (await subjectService.getDocumentsForSubject(child.id, { limit: 100, ext: "pdf" })).length,
+      (await subjectService.getDocumentsForSubject(child.id, { limit: 100, ext: "pdf" }, ownerId)).length,
     `${nodeOf(treePdf, child.id).fileCount}`);
 
   // --- refusals -----------------------------------------------------------
@@ -284,7 +291,7 @@ const sameSet = (rows, expected) =>
 
   // --- facets -------------------------------------------------------------
 
-  const facets = await fileRepository.filterFacets();
+  const facets = await fileRepository.filterFacets(ownerId);
   const facetExts = Object.fromEntries(facets.extensions.map((e) => [e.ext, e.count]));
   check("the type list offered to the user includes the no-extension bucket",
     facetExts.none >= 1, Object.keys(facetExts).slice(0, 8).join(", "));

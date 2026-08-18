@@ -37,9 +37,29 @@ export function AssistantProvider({ children }) {
     []
   );
 
+  /**
+   * "Open the assistant and start this sentence for me."
+   *
+   * The panel owns whether it is open and what is typed in it, which is right
+   * -- but it leaves the rest of the app unable to hand the user into a
+   * conversation. The Library's empty state needs exactly that: a new account
+   * has no folders, and the useful next step is describing what they are going
+   * to file rather than clicking "new folder" twelve times.
+   *
+   * The text is PREFILLED, not sent. It is a starting sentence the user is
+   * meant to edit -- "I get invoices from clients" is a prompt to finish, not a
+   * question to fire off. Sending it for them would put words in their mouth
+   * and spend an API call on a sentence they did not write.
+   *
+   * Counter alongside the text for the same reason `reveal` has one: asking
+   * twice with the same sentence must still register.
+   */
+  const [ask, setAsk] = useState({ text: null, n: 0 });
+  const askAssistant = useCallback((text) => setAsk((a) => ({ text, n: a.n + 1 })), []);
+
   const value = useMemo(
-    () => ({ context, setContext, changeToken, notifyChanged, reveal, revealSubject }),
-    [context, changeToken, notifyChanged, reveal, revealSubject]
+    () => ({ context, setContext, changeToken, notifyChanged, reveal, revealSubject, ask, askAssistant }),
+    [context, changeToken, notifyChanged, reveal, revealSubject, ask, askAssistant]
   );
 
   return <AssistantContext.Provider value={value}>{children}</AssistantContext.Provider>;
@@ -106,4 +126,18 @@ export function useAssistantChanges(onChanged) {
     onChanged?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [changeToken]);
+}
+
+/**
+ * Receive "open up and start this sentence" requests. The panel implements it;
+ * nothing else needs to know how the panel is opened.
+ */
+export function useAssistantAsk(onAsk) {
+  const { ask } = useAssistant();
+  const handler = useRef(onAsk);
+  handler.current = onAsk;
+  useEffect(() => {
+    if (ask.n === 0 || !ask.text) return;
+    handler.current?.(ask.text);
+  }, [ask]);
 }

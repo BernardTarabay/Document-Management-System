@@ -1,13 +1,15 @@
-import { useState } from "react";
-import { NavLink } from "react-router-dom";
+import { useCallback, useMemo, useState } from "react";
+import { NavLink, useNavigate } from "react-router-dom";
 import {
   LayoutDashboard, FileText, FolderTree, LifeBuoy, Images, Copy, Wand2,
   HardDrive, Inbox, ScrollText, Users, Boxes, Menu, X, MoreHorizontal,
-  LogOut, User as UserIcon, ChevronDown, MonitorSmartphone,
+  LogOut, User as UserIcon, ChevronDown, MonitorSmartphone, Stamp,
+  GripVertical, Pin, PinOff, RotateCcw,
 } from "lucide-react";
 import { useAuth } from "../context/AuthContext";
 import { usePolling } from "../hooks/useApiData";
 import { api } from "../services/apiClient";
+import { NAV_LAYOUT_KEY, resolveNav, toStored, pinAt, unpin, reorder } from "../lib/navLayout";
 
 /**
  * WHY THE NAVIGATION MOVED TO THE TOP
@@ -35,20 +37,41 @@ import { api } from "../services/apiClient";
  * Files and Subjects constantly and at the audit log twice a year.
  */
 
-// The daily loop. Order follows the lifecycle a document goes through, which
-// is also roughly the order of how often each is opened.
+/**
+ * THE DEFAULT SPLIT, WHICH IS NOW ONLY A DEFAULT.
+ *
+ * `defaultPrimary` marks the daily loop -- what a new account sees on the
+ * header row. Anyone can drag a destination between the row and "More", or pin
+ * it from the menu, and their arrangement is remembered (lib/navLayout.js).
+ * Order below still follows the lifecycle a document goes through, which is
+ * roughly how often each is opened.
+ */
 const PRIMARY = [
-  { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
-  { to: "/files", label: "Files", icon: FileText },
-  { to: "/subjects", label: "Subjects", icon: FolderTree },
-  { to: "/triage", label: "Triage", icon: LifeBuoy, badgeKey: "triage" },
-  { to: "/photos", label: "Photos", icon: Images, badgeKey: "photos" },
-  { to: "/duplicates", label: "Duplicates", icon: Copy, permission: "duplicate.manage" },
+  // The Library leads because it is what this application is for. Everything
+  // else here is either a narrower lens on the same documents (Files, Types)
+  // or a queue of work about them (Triage, Duplicates).
+  { to: "/", label: "Library", icon: FolderTree, end: true, defaultPrimary: true },
+  { to: "/files", label: "Files", icon: FileText, defaultPrimary: true },
+  // Beside the Library because they are a pair, not a hierarchy: these are the
+  // two independent classification axes (docs/03-taxonomy.md §3.4), and
+  // putting the second one behind "More" while the first is primary is how
+  // half a feature quietly stops existing.
+  { to: "/document-types", label: "Types", icon: Stamp, defaultPrimary: true },
+  { to: "/triage", label: "Triage", icon: LifeBuoy, badgeKey: "triage", defaultPrimary: true },
+  { to: "/photos", label: "Photos", icon: Images, badgeKey: "photos", defaultPrimary: true },
+  { to: "/duplicates", label: "Duplicates", icon: Copy, permission: "duplicate.manage", defaultPrimary: true },
 ];
 
 // Reached occasionally and deliberately. Behind "More" rather than removed --
-// hiding a destination entirely is how a feature stops existing.
+// hiding a destination entirely is how a feature stops existing. Any of these
+// can be dragged or pinned onto the header row.
 const SECONDARY = [
+  // Moved off the front row when the Library took over the landing page. It
+  // is not demoted in importance -- it is the best view of the pipeline in the
+  // app -- but the numbers a person needs *daily* (how much is unfiled, how
+  // much is still being processed) now sit on the Library itself, and this
+  // answers the deeper questions you go looking for on purpose.
+  { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { to: "/rename-proposals", label: "Rename proposals", icon: Wand2, badgeKey: "pendingProposals" },
   { to: "/storage-locations", label: "Storage locations", icon: HardDrive },
   { to: "/devices", label: "Devices", icon: MonitorSmartphone },
@@ -56,6 +79,20 @@ const SECONDARY = [
   { to: "/audit-log", label: "Audit log", icon: ScrollText, permission: "audit.view" },
   { to: "/users", label: "Users", icon: Users, permission: "user.manage" },
 ];
+
+/** Every destination in one list; where each one SITS is decided at runtime. */
+const ALL_ITEMS = [...PRIMARY, ...SECONDARY];
+
+/**
+ * The drag payloads this header understands.
+ *
+ * Two different gestures land on the same targets and must not be confused:
+ * rearranging the navigation, and dragging a document somewhere. Custom MIME
+ * types keep them apart, and keep anything else dragged onto the page (a
+ * desktop file, selected text) from being read as either.
+ */
+const NAV_MIME = "text/dms-nav-item";
+const FILE_MIME = "text/dms-file-id";
 
 // Polled rather than fetched once so the badges reflect work that shows up
 // from a scan still running in the background. 30s is frequent enough to feel
@@ -98,9 +135,110 @@ export function TopNav() {
     photos: (badgeData?.photos?.counts?.pending || 0) + (badgeData?.photos?.counts?.failed || 0),
   };
 
-  const visible = (items) => items.filter((i) => !i.permission || hasPermission(i.permission));
-  const primary = visible(PRIMARY);
-  const secondary = visible(SECONDARY);
+  const navigate = useNavigate();
+
+  /**
+   * The user's own header arrangement.
+   *
+   * localStorage throws in private-mode Safari, and a header that fails to
+   * render takes the whole application with it -- so a broken read falls back
+   * to the shipped default rather than propagating.
+   */
+  const [pinned, setPinned] = useState(() => {
+    try {
+      const raw = localStorage.getItem(NAV_LAYOUT_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const savePinned = useCallback((next) => {
+    setPinned(next);
+    try {
+      if (next === null) localStorage.removeItem(NAV_LAYOUT_KEY);
+      else localStorage.setItem(NAV_LAYOUT_KEY, JSON.stringify(next));
+    } catch { /* a layout that cannot be saved still works for this session */ }
+  }, []);
+
+  const { primary, secondary } = useMemo(
+    () => resolveNav(ALL_ITEMS, pinned, hasPermission),
+    [pinned, hasPermission]
+  );
+
+  // The order to mutate from. When nothing has been customised yet, that is
+  // whatever is on the header right now -- so the first drag rearranges what
+  // the user can see rather than an invisible default.
+  const currentOrder = useMemo(() => toStored(primary), [primary]);
+
+  // --- dragging -----------------------------------------------------------
+  const [draggingKey, setDraggingKey] = useState(null);
+  const [dropHint, setDropHint] = useState(null); // { key, before } | "more"
+
+  const isNavDrag = (e) => [...e.dataTransfer.types].includes(NAV_MIME);
+  const isFileDrag = (e) => [...e.dataTransfer.types].includes(FILE_MIME);
+
+  const startNavDrag = (e, key) => {
+    e.dataTransfer.setData(NAV_MIME, key);
+    e.dataTransfer.effectAllowed = "move";
+    setDraggingKey(key);
+  };
+  const endNavDrag = () => { setDraggingKey(null); setDropHint(null); };
+
+  /**
+   * A destination accepts two very different drops.
+   *
+   * A NAV item lands here to be reordered. A FILE lands here to take you to
+   * that page -- dragging a document onto "Duplicates" is a way to get there
+   * while still holding it, which is otherwise impossible: you cannot navigate
+   * mid-drag with the mouse already down.
+   */
+  const onItemDragOver = (e, item, index) => {
+    if (isNavDrag(e)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      const box = e.currentTarget.getBoundingClientRect();
+      setDropHint({ key: item.to, before: e.clientX < box.left + box.width / 2 });
+    } else if (isFileDrag(e)) {
+      e.preventDefault();
+      // "link", not "move": nothing is filed here. The cursor should not
+      // promise that dropping a document on a menu entry files it there.
+      e.dataTransfer.dropEffect = "link";
+      setDropHint({ key: item.to, before: null });
+    }
+    void index;
+  };
+
+  const onItemDrop = (e, item) => {
+    if (isNavDrag(e)) {
+      e.preventDefault();
+      const key = e.dataTransfer.getData(NAV_MIME);
+      const box = e.currentTarget.getBoundingClientRect();
+      const before = e.clientX < box.left + box.width / 2;
+      savePinned(reorder(currentOrder, key, item.to, before));
+    } else if (isFileDrag(e)) {
+      e.preventDefault();
+      navigate(item.to);
+    }
+    endNavDrag();
+  };
+
+  // Dropping a header item on "More" demotes it; dropping a file navigates.
+  const onMoreDrop = (e) => {
+    if (isNavDrag(e)) {
+      e.preventDefault();
+      savePinned(unpin(currentOrder, e.dataTransfer.getData(NAV_MIME)));
+    }
+    endNavDrag();
+  };
+
+  const pinToHeader = (key) => savePinned(pinAt(currentOrder, key));
+  const unpinFromHeader = (key) => savePinned(unpin(currentOrder, key));
+  const resetOrder = () => savePinned(null);
+
+  // A layout is "customised" only if it differs from what shipped.
+  const customised = pinned !== null;
 
   return (
     <header className="sticky top-0 z-40 shrink-0 border-b border-white/5 bg-base-900/70 backdrop-blur-xl">
@@ -115,29 +253,67 @@ export function TopNav() {
 
         {/* Primary destinations. Hidden below md, where the drawer takes over. */}
         <nav className="ml-2 hidden min-w-0 flex-1 items-center gap-0.5 md:flex" aria-label="Main">
-          {primary.map((item) => (
-            <NavLink
+          {primary.map((item, index) => (
+            <div
               key={item.to}
-              to={item.to}
-              end={item.end}
-              className={({ isActive }) => (isActive ? "topnav-link-active" : "topnav-link")}
+              className="relative"
+              draggable
+              onDragStart={(e) => startNavDrag(e, item.to)}
+              onDragEnd={endNavDrag}
+              onDragOver={(e) => onItemDragOver(e, item, index)}
+              onDragLeave={() => setDropHint(null)}
+              onDrop={(e) => onItemDrop(e, item)}
             >
-              <item.icon size={15} aria-hidden="true" />
-              {/* The label is what makes this navigable; only drop it when
-                  there genuinely is not room, which is below lg. */}
-              <span className="hidden lg:inline">{item.label}</span>
-              <Badge count={item.badgeKey ? badges[item.badgeKey] : 0} />
-            </NavLink>
+              {/* Where the item would land, shown on the side the pointer is
+                  on. Without it, dropping is a guess -- you find out where it
+                  went only after letting go. */}
+              {dropHint?.key === item.to && dropHint.before !== null && (
+                <span
+                  aria-hidden="true"
+                  className={"absolute inset-y-1 w-0.5 rounded bg-brand-400 " + (dropHint.before ? "-left-0.5" : "-right-0.5")}
+                />
+              )}
+              <NavLink
+                to={item.to}
+                end={item.end}
+                className={({ isActive }) =>
+                  (isActive ? "topnav-link-active" : "topnav-link") +
+                  " cursor-grab active:cursor-grabbing" +
+                  (draggingKey === item.to ? " opacity-40" : "") +
+                  // A file hovering over a destination: this is where you will
+                  // be taken, so it reads as a target rather than a drop slot.
+                  (dropHint?.key === item.to && dropHint.before === null
+                    ? " ring-1 ring-inset ring-brand-400/70"
+                    : "")
+                }
+              >
+                <item.icon size={15} aria-hidden="true" />
+                {/* The label is what makes this navigable; only drop it when
+                    there genuinely is not room, which is below lg. */}
+                <span className="hidden lg:inline">{item.label}</span>
+                <Badge count={item.badgeKey ? badges[item.badgeKey] : 0} />
+              </NavLink>
+            </div>
           ))}
 
-          {secondary.length > 0 && (
+          {(secondary.length > 0 || customised) && (
             <div className="relative">
               <button
                 type="button"
                 onClick={() => setMoreOpen((v) => !v)}
                 aria-expanded={moreOpen}
                 aria-haspopup="menu"
-                className="topnav-link"
+                /* Dropping a header item here demotes it -- the reverse of
+                   dragging one out, and the gesture people try first. */
+                onDragOver={(e) => {
+                  if (!isNavDrag(e)) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  setDropHint("more");
+                }}
+                onDragLeave={() => setDropHint(null)}
+                onDrop={onMoreDrop}
+                className={"topnav-link" + (dropHint === "more" ? " ring-1 ring-inset ring-brand-400/70" : "")}
               >
                 <MoreHorizontal size={15} aria-hidden="true" />
                 <span className="hidden lg:inline">More</span>
@@ -146,22 +322,85 @@ export function TopNav() {
               {moreOpen && (
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setMoreOpen(false)} aria-hidden="true" />
-                  <div className="glass-card animate-fade-in-up absolute left-0 z-20 mt-2 w-60 p-1.5">
+                  <div className="glass-card animate-fade-in-up absolute left-0 z-20 mt-2 w-72 p-1.5">
                     {secondary.map((item) => (
-                      <NavLink
+                      <div
                         key={item.to}
-                        to={item.to}
-                        onClick={() => setMoreOpen(false)}
-                        className={({ isActive }) =>
-                          "flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm " +
-                          (isActive ? "bg-white/[0.06] text-base-50" : "text-base-300 hover:bg-white/[0.04]")
-                        }
+                        className="group/nav flex items-center gap-1"
+                        draggable
+                        onDragStart={(e) => startNavDrag(e, item.to)}
+                        onDragEnd={endNavDrag}
                       >
-                        <item.icon size={15} aria-hidden="true" />
-                        <span className="flex-1">{item.label}</span>
-                        <Badge count={item.badgeKey ? badges[item.badgeKey] : 0} />
-                      </NavLink>
+                        <NavLink
+                          to={item.to}
+                          onClick={() => setMoreOpen(false)}
+                          className={({ isActive }) =>
+                            "flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-3 py-2 text-sm " +
+                            (isActive ? "bg-white/[0.06] text-base-50" : "text-base-300 hover:bg-white/[0.04]")
+                          }
+                        >
+                          <item.icon size={15} aria-hidden="true" />
+                          <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                          <Badge count={item.badgeKey ? badges[item.badgeKey] : 0} />
+                        </NavLink>
+                        {/* The keyboard path. Dragging is the discoverable
+                            gesture; a button is the one that works without a
+                            mouse, and rearranging your own navigation should
+                            not require one. */}
+                        <button
+                          type="button"
+                          onClick={() => pinToHeader(item.to)}
+                          title={`Show ${item.label} on the header`}
+                          aria-label={`Show ${item.label} on the header`}
+                          className="shrink-0 rounded-lg p-1.5 text-base-500 opacity-0 hover:bg-white/[0.06] hover:text-brand-300 focus:opacity-100 group-hover/nav:opacity-100"
+                        >
+                          <Pin size={13} />
+                        </button>
+                      </div>
                     ))}
+
+                    {/* What is already on the header, so it can be taken off
+                        again without a mouse. */}
+                    {primary.length > 0 && (
+                      <>
+                        <div className="my-1.5 border-t border-white/5" />
+                        <p className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-base-500">
+                          On the header — drag to reorder
+                        </p>
+                        {primary.map((item) => (
+                          <div key={item.to} className="group/pin flex items-center gap-1">
+                            <span className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-3 py-1.5 text-sm text-base-400">
+                              <GripVertical size={12} className="shrink-0 text-base-600" aria-hidden="true" />
+                              <item.icon size={14} aria-hidden="true" />
+                              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => unpinFromHeader(item.to)}
+                              title={`Move ${item.label} into More`}
+                              aria-label={`Move ${item.label} into More`}
+                              className="shrink-0 rounded-lg p-1.5 text-base-500 opacity-0 hover:bg-white/[0.06] hover:text-base-200 focus:opacity-100 group-hover/pin:opacity-100"
+                            >
+                              <PinOff size={13} />
+                            </button>
+                          </div>
+                        ))}
+                      </>
+                    )}
+
+                    {customised && (
+                      <>
+                        <div className="my-1.5 border-t border-white/5" />
+                        <button
+                          type="button"
+                          onClick={() => { resetOrder(); setMoreOpen(false); }}
+                          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs text-base-400 hover:bg-white/[0.04] hover:text-base-200"
+                        >
+                          <RotateCcw size={13} aria-hidden="true" />
+                          Reset to the default order
+                        </button>
+                      </>
+                    )}
                   </div>
                 </>
               )}

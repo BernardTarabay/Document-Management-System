@@ -39,3 +39,9 @@ out/
 # Local databases
 *.sqlite
 *.sqlite3
+
+# Claude Code workspace: machine-local settings (settings.local.json carries
+# absolute paths from this machine) and scratch git worktrees, which are whole
+# second checkouts of this same repository -- 688 files that would be committed
+# into themselves.
+.claude/

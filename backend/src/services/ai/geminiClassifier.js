@@ -86,6 +86,13 @@ document belongs in while still being completely sure what the document IS and t
 well). If an embedded title is provided and it's genuinely descriptive, prefer it (or a
 light cleanup of it) over inventing your own -- it's literally what the author called it.
 
+Some candidates carry a "for:" note. That is the user's own description of what belongs in
+that folder, written by them, and it OUTRANKS the folder name -- a folder called "Misc"
+whose note says "bank statements and nothing else" is for bank statements, and a document
+the note explicitly excludes does not belong there however well the name seems to fit. A
+candidate with no note is judged on its name alone, as before. Never read a note as a
+description of the DOCUMENT in front of you; it describes the destination.
+
 CRITICAL -- never translate. This repository holds documents in Arabic, French, Hebrew, and
 English, often mixed together. short_title, summary, and entities.party must always stay in
 whatever language and script the SOURCE DOCUMENT is actually written in -- an Arabic document
@@ -115,9 +122,48 @@ const { acquireRateLimitSlot, parseRetryDelayMs, sleep } = require("./rateLimite
 
 const MAX_429_RETRIES = 3;
 
+/**
+ * How much of a folder's description to send.
+ *
+ * Long enough for a real instruction ("deeds and correspondence for the
+ * monastery at Haifa; anything mentioning Mount Carmel belongs here, general
+ * Israel correspondence does not"), short enough that a large taxonomy does
+ * not crowd out the document itself. The whole candidate list is sent on every
+ * classification, so this multiplies by the size of the tree.
+ */
+const MAX_DESCRIPTION_CHARS = 240;
+
+const describeCandidate = (label, description) => {
+  const clean = String(description || "").replace(/\s+/g, " ").trim();
+  if (!clean) return label;
+  const trimmed = clean.length > MAX_DESCRIPTION_CHARS
+    ? `${clean.slice(0, MAX_DESCRIPTION_CHARS - 1).trimEnd()}…`
+    : clean;
+  return `${label} | for: ${trimmed}`;
+};
+
+/**
+ * THE DESCRIPTION IS THE USER TELLING THE MODEL WHAT THE FOLDER IS FOR.
+ *
+ * Until now this list carried a slug and a name and nothing else, so the model
+ * had to infer a folder's entire purpose from one string. A folder called
+ * "Haifa Monastery" therefore matched documents that said "Haifa Monastery",
+ * and there was no way to say "anything mentioning Mount Carmel belongs here
+ * too" or "this is NOT for general correspondence".
+ *
+ * `subjects.description` has existed in the schema and in the folder dialog the
+ * whole time; it simply never reached the classifier. This is the closest thing
+ * the system has to being taught -- it is not learning, since nothing here
+ * adapts from past filings, but it turns a folder from a name to be guessed at
+ * into an instruction to be followed.
+ */
 function buildInput({ filename, bodyText, subjects, documentTypes, embeddedTitle }) {
-  const subjectList = subjects.map((s) => `- slug: ${s.slug} | name: ${s.name}`).join("\n") || "(none defined)";
-  const docTypeList = documentTypes.map((d) => `- code: ${d.code} | name: ${d.name}`).join("\n") || "(none defined)";
+  const subjectList = subjects
+    .map((s) => describeCandidate(`- slug: ${s.slug} | name: ${s.name}`, s.description))
+    .join("\n") || "(none defined)";
+  const docTypeList = documentTypes
+    .map((d) => describeCandidate(`- code: ${d.code} | name: ${d.name}`, d.description))
+    .join("\n") || "(none defined)";
   const embeddedTitleLine = embeddedTitle ? `Embedded document title metadata: "${embeddedTitle}"` : "Embedded document title metadata: (none)";
 
   return `Filename: ${filename}
@@ -250,6 +296,23 @@ async function classify({ filename, bodyText, subjects, documentTypes, embeddedT
   return {
     subject,
     documentType,
+    /**
+     * What the model literally said, kept separate from what resolved.
+     *
+     * These two cases used to be indistinguishable once stored: "the model
+     * declined to pick a type" and "the model picked a code that isn't in the
+     * list" both ended as a null column and an empty raw_output. When the
+     * document-type axis turned out to be empty across the corpus there was
+     * no way to tell from the database which of those had been happening --
+     * the picks were never persisted at all. classifyProcessor writes these
+     * into raw_output so the next person can answer that from data.
+     */
+    picks: {
+      subjectSlug: result.subject_slug || null,
+      documentTypeCode: result.document_type_code || null,
+      subjectResolved: Boolean(subject) || !result.subject_slug,
+      documentTypeResolved: Boolean(documentType) || !result.document_type_code,
+    },
     confidenceLevel: ["low", "medium", "high"].includes(result.confidence) ? result.confidence : "low",
     shortTitle: String(result.short_title || "").slice(0, 200),
     summary: String(result.summary || "").slice(0, 1000),
@@ -263,4 +326,12 @@ async function classify({ filename, bodyText, subjects, documentTypes, embeddedT
   };
 }
 
-module.exports = { classify, GeminiClassificationError, MAX_EXCERPT_CHARS };
+// `buildInput` and `SYSTEM_INSTRUCTION` are exported for verification only.
+// What actually reaches the model is the one thing here with no other way to
+// observe it, and the failures it hides are silent by nature -- a folder
+// description that never made it into the prompt looks exactly like a model
+// that ignored it. See scripts/verify-folder-descriptions.js.
+module.exports = {
+  classify, GeminiClassificationError, MAX_EXCERPT_CHARS,
+  buildInput, SYSTEM_INSTRUCTION, MAX_DESCRIPTION_CHARS,
+};

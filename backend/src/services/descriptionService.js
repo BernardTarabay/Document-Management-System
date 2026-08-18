@@ -676,10 +676,48 @@ async function ensureEmbedding(file, row) {
   return result.ok;
 }
 
+/**
+ * Sources where a model actually PERCEIVED the content, rather than reading
+ * text someone else extracted from it.
+ *
+ * The distinction matters outside this module. `generateNamesProcessor` refuses
+ * to propose a name when a file's text is unusable, on the reasoning that the
+ * only information left is the filename, so any name would be invented. That
+ * was true when extracted text was the only signal. It is not true of a
+ * photograph: there is no text because it is a picture, and the describer
+ * looked at it. "Two people embracing in a kitchen" was read off the image, not
+ * hallucinated from noise.
+ *
+ * Deliberately NOT included:
+ *   metadata       built in code from size/extension/date with no model at all
+ *   document_text  text, which is exactly what the text-quality check governs
+ *   ocr_text       ditto, and OCR noise is the original reason that check exists
+ *   failed         no description was produced
+ */
+const PERCEIVED_SOURCES = Object.freeze(new Set(["image", "video", "audio"]));
+
+/**
+ * Did this description come from something looking at the file's content?
+ *
+ * @param {object|null} row - a file_descriptions row
+ *
+ * An inherited description is resolved to the source it was copied FROM: the
+ * twin has byte-identical content, so a vision description of one is a vision
+ * description of the other. Without this, the second copy of a photo would be
+ * treated as unnameable purely because it arrived second.
+ */
+function isPerceivedDescription(row) {
+  if (!row || !row.description) return false;
+  const source =
+    row.source === "inherited" ? row.detail?.originalSource || null : row.source;
+  return PERCEIVED_SOURCES.has(source);
+}
+
 module.exports = {
   describeFile,
   // exported for tests and for the search layer's query-side reuse
   buildMetadataDescription, buildEmbeddingInput, humaniseFilename,
   describeKind, formatBytes, usableText,
+  isPerceivedDescription, PERCEIVED_SOURCES,
   STAGE, CAPPED_ACTIONS,
 };

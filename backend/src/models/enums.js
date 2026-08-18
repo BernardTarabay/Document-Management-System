@@ -83,6 +83,10 @@ const JobType = Object.freeze({
   // migration 034. One plain-language description per file, and the embedding
   // that makes it findable by describing it -- services/descriptionService.js.
   DESCRIBE: "describe",
+  // migration 038. Empties the Trash on a timer -- the only job that removes
+  // rows for good. See jobs/processors/purgeTrashProcessor.js for what makes
+  // that safe to run unattended.
+  PURGE_TRASH: "purge_trash",
 });
 
 const JobStatus = Object.freeze({

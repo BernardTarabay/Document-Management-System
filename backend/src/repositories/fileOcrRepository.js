@@ -6,6 +6,7 @@
 // different claims and the naming pipeline treats them differently -- see the
 // header of services/ocr/ocrService.js.
 const db = require("../config/database");
+const { NOT_A_DUPLICATE_COPY } = require("./fileFilters");
 const { requireOwner } = require("./ownership");
 
 /**
@@ -74,10 +75,15 @@ async function findByFileForOwner(fileId, ownerUserId) {
 async function countByStatus(ownerUserId) {
   requireOwner(ownerUserId, "fileOcr.countByStatus");
   const { rows } = await db.query(
+    // Same definition of "a document" the Library and the dashboard use
+    // (fileFilters.NOT_A_DUPLICATE_COPY): the badge on the Photos tab counts
+    // pictures, and a second copy of a picture is not a second picture. Without
+    // this the grid showed 16 and the badge said 18.
     `SELECT f.ocr_status::text AS status, count(*)::int AS count
        FROM files f
       WHERE f.owner_user_id = $1
         AND f.status = 'active'
+        AND ${NOT_A_DUPLICATE_COPY}
         AND (f.is_image = true OR f.ocr_status <> 'not_needed')
       GROUP BY f.ocr_status`,
     [ownerUserId]

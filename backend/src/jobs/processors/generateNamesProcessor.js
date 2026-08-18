@@ -9,6 +9,8 @@ const db = require("../../config/database");
 const fileRepository = require("../../repositories/fileRepository");
 const fileMetadataRepository = require("../../repositories/fileMetadataRepository");
 const fileContentRepository = require("../../repositories/fileContentRepository");
+const fileDescriptionRepository = require("../../repositories/fileDescriptionRepository");
+const descriptionService = require("../../services/descriptionService");
 const { looksLikeMojibake } = require("../../services/extraction/ole/codePageString");
 const classificationResultRepository = require("../../repositories/classificationResultRepository");
 const subjectRepository = require("../../repositories/subjectRepository");
@@ -99,10 +101,11 @@ async function handle({ fileId }) {
   // records one, because a file whose state never moves off 'discovered' looks
   // permanently unstarted no matter how much work was actually done to it.
 
-  const [classifications, fileMetadata, content] = await Promise.all([
+  const [classifications, fileMetadata, content, description] = await Promise.all([
     classificationResultRepository.listProposedForFile(fileId),
     fileMetadataRepository.findByFile(fileId),
     fileContentRepository.findByFile(fileId),
+    fileDescriptionRepository.findByFile(fileId),
   ]);
   const latest = classifications[0];
 
@@ -122,9 +125,32 @@ async function handle({ fileId }) {
   //
   // An embedded title still counts: that is metadata the author wrote, and
   // it survives even when the page content does not extract.
+  //
+  // AND SO DOES A TITLE THAT CAME FROM LOOKING AT THE FILE.
+  //
+  // The paragraph above reasons that with no readable content "the only
+  // information available IS the current name". That was true when extracted
+  // text was the only signal. It stopped being true when the describe stage
+  // became multimodal: a photograph has no text because it is a photograph,
+  // and the describer read the picture. "Two people embracing in a kitchen" is
+  // not a reshuffle of "WhatsApp Image 2026-07-29 at 20.17.33.jpeg" and it is
+  // not an invention -- it is the one genuinely new fact anyone has about that
+  // file.
+  //
+  // Without this, every photo and video in an archive skipped naming while
+  // holding a perfectly good title the pipeline had already paid for, and the
+  // rename queue stayed empty on exactly the files whose names are worst.
+  //
+  // The original protection is untouched, because it turns on a different
+  // question. A scanned PDF whose OCR returned noise is described from
+  // `ocr_text`/`document_text`, never from `image`/`video`, so it still
+  // declines -- see descriptionService.PERCEIVED_SOURCES for what does and
+  // does not count, and why `metadata` (built in code, no model) does not.
   const textUnusable = Boolean(content?.text_quality) && content.text_quality !== "ok";
   const embeddedTitleRaw = fileMetadata?.metadata?.title;
-  if (textUnusable && !isUsableTitle(embeddedTitleRaw)) {
+  const perceivedTitle =
+    descriptionService.isPerceivedDescription(description) && isUsableTitle(file.ai_short_title);
+  if (textUnusable && !isUsableTitle(embeddedTitleRaw) && !perceivedTitle) {
     await auditLogRepository.record({
       action: "rename.skipped_unreadable",
       entityType: "file",

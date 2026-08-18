@@ -2,12 +2,14 @@ const env = require("./config/env");
 const app = require("./app");
 const { pool } = require("./config/database");
 const { startEmailSyncScheduler, stopEmailSyncScheduler } = require("./jobs/emailSyncScheduler");
+const { startTrashPurgeScheduler, stopTrashPurgeScheduler } = require("./jobs/trashPurgeScheduler");
 const filesystemBrowseService = require("./services/filesystemBrowseService");
 const { storageWatcher } = require("./jobs/storageWatcher");
 
 const server = app.listen(env.port, () => {
   console.log(`Server running on http://localhost:${env.port} [${env.nodeEnv}]`);
   startEmailSyncScheduler();
+  startTrashPurgeScheduler();
 
   // Real-time ingestion. Lives in the API process rather than the worker
   // for the same reason the email scheduler does: it only ever ENQUEUES
@@ -39,6 +41,7 @@ function shutdown(signal) {
   console.log(`[server] Received ${signal}, shutting down...`);
 
   stopEmailSyncScheduler();
+  stopTrashPurgeScheduler();
   storageWatcher.stop();
 
   // Backstop: if anything is still holding the loop open after this, stop

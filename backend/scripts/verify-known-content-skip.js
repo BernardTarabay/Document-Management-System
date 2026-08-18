@@ -38,6 +38,10 @@ const classificationResultRepository = require("../src/repositories/classificati
 const fileContentRepository = require("../src/repositories/fileContentRepository");
 const fileMetadataRepository = require("../src/repositories/fileMetadataRepository");
 const subjectRepository = require("../src/repositories/subjectRepository");
+const duplicateGroupRepository = require("../src/repositories/duplicateGroupRepository");
+const fileRepository = require("../src/repositories/fileRepository");
+const dashboardRepository = require("../src/repositories/dashboardRepository");
+const { parseFileFilters } = require("../src/repositories/fileFilters");
 const { closeAllQueues } = require("../src/queues");
 const { dequeueFixtureJobs, pauseQueues, resumeQueues } = require("./_fixtureQueue");
 const { closeRedisConnection } = require("../src/config/redis");
@@ -280,6 +284,60 @@ const jobsFor = async (fileId, type) =>
       WHERE action='file.adopted_known_content' AND entity_id = ANY($1)`,
     [REPEATS.map((n) => byName[n].id)])).rows[0].n;
   check("every skip is written to the audit log, not silent", audited === 3, `${audited} entries`);
+
+  // --- and once settled, they stop inflating every number ------------------
+  //
+  // THE COMPLAINT THIS COMES FROM: "it still says 31 documents, the photos are
+  // duped too." The pipeline was doing its job -- duplicates detected, groups
+  // resolved, a canonical copy chosen -- and the Library went on listing both
+  // copies of everything, because the exclusion lived only in the
+  // subject-scoped queries and was missing from the listing, the count, the id
+  // sweep, the photo grid and the dashboard.
+  //
+  // A resolved group means the question "which copy do I keep" has an answer.
+  // Every view that reports "what documents do I have" has to use it, and they
+  // have to agree with each other -- that trio has drifted apart twice already.
+
+  console.log("\nand once the duplicate is settled:\n");
+
+  const scoped = { pathPrefix: "" };
+  const before = await fileRepository.countMatching({ filters: parseFileFilters(scoped, admin.id) });
+
+  // Resolve every group the repeats belong to, choosing folder A's copy.
+  const groupIds = (await p.query(
+    `SELECT DISTINCT duplicate_group_id AS id FROM duplicate_group_members WHERE file_id = ANY($1)`,
+    [REPEATS.map((n) => byName[n].id)])).rows.map((r) => r.id);
+  for (const gid of groupIds) {
+    const members = await duplicateGroupRepository.listMembers(gid);
+    const keeper = members.find((m) => m.storage_location_id === locA) || members[0];
+    if (keeper) await duplicateGroupRepository.setCanonicalFile(gid, keeper.file_id || keeper.id, admin.id);
+  }
+
+  const after = await fileRepository.countMatching({ filters: parseFileFilters(scoped, admin.id) });
+  check("resolving the duplicates lowers the document count",
+    after < before, `${before} -> ${after}`);
+
+  const listed = await fileRepository.listNotDeleted({
+    limit: 500, filters: parseFileFilters(scoped, admin.id),
+  });
+  check("...the listing and the count agree",
+    listed.length === after, `list ${listed.length}, count ${after}`);
+
+  const ids = await fileRepository.idsMatching({
+    filters: parseFileFilters(scoped, admin.id), subjectId: null, limit: 5000,
+  });
+  check("...and so does 'select all', which has drifted from them twice",
+    ids.length === after, `ids ${ids.length}, count ${after}`);
+
+  const overview = await dashboardRepository.overview(admin.id);
+  check("...and the dashboard reports the same number as the library",
+    overview.total_files === after, `dashboard ${overview.total_files}, library ${after}`);
+
+  const stillGrouped = (await p.query(
+    `SELECT count(DISTINCT dgm.duplicate_group_id)::int n FROM duplicate_group_members dgm
+      WHERE dgm.file_id = ANY($1)`, [REPEATS.map((n) => byName[n].id)])).rows[0].n;
+  check("...while the duplicate groups themselves are untouched -- nothing was deleted",
+    stillGrouped === 3, `${stillGrouped} groups still recorded`);
 
   console.log(`\n================ ${failed === 0 ? "ALL PASSED" : `${failed} FAILED`} (${passed} passed) ================`);
   if (failed > 0) process.exitCode = 1;

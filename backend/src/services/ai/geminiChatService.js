@@ -18,7 +18,13 @@ const MAX_VISIBLE_FILES = 200;
 
 const ACTION_TYPES = [
   "move_file", "rename_file", "delete_file",
-  "move_subject_contents", "create_subject", "rename_subject", "delete_subject",
+  // move_by_filter is move_subject_contents' general case: it files everything
+  // MATCHING criteria rather than everything currently in one folder. The
+  // difference matters at scale -- "every 2019 invoice from the old NAS" is not
+  // a folder, and enumerating it as thousands of move_file actions is not a
+  // plan the model can produce or the user can review.
+  "move_subject_contents", "move_by_filter",
+  "create_subject", "rename_subject", "delete_subject",
   "approve_proposals", "reject_proposals", "resolve_duplicates",
   // Read-only. Run as soon as they are proposed instead of waiting for an
   // Apply click -- see READ_ONLY_ACTIONS below.
@@ -53,10 +59,25 @@ const RESPONSE_SCHEMA = {
           summary: { type: "string", description: "One short, human-readable sentence describing exactly what this action does, e.g. 'Move Invoice_2024.pdf to Finance > Invoices' or 'Move all 12 files in Scans > Unsorted to Personal > Medical'. Write it in the SAME language the user is using -- these English examples show the shape, not the language. Keep file and subject names in their original script." },
           fileId: { type: ["string", "null"], description: "Required for move_file -- must be an id from the provided visible-files list, never invented." },
           fromSubjectId: { type: ["string", "null"], description: "Required for move_subject_contents -- the subject whose files are being moved out." },
-          toSubjectId: { type: ["string", "null"], description: "Required for move_file and move_subject_contents -- the destination subject." },
+          toSubjectId: { type: ["string", "null"], description: "Required for move_file, move_subject_contents and move_by_filter -- the destination subject." },
+          filter: {
+            type: ["object", "null"],
+            description: "Required for move_by_filter -- WHICH files to move, by criteria rather than by id. Every field is optional and they combine as AND. Omit a field entirely rather than sending null or an empty string. At least one field must be set: an empty filter would move the entire repository and is refused.",
+            properties: {
+              ext: { type: ["string", "null"], description: "File extensions, comma-separated, without dots: 'pdf' or 'pdf,docx'. Use 'none' for files that have no extension." },
+              dateFrom: { type: ["string", "null"], description: "Earliest DOCUMENT date, YYYY-MM-DD. This is the date the document is FROM (read out of the file), not when it was imported. Inclusive." },
+              dateTo: { type: ["string", "null"], description: "Latest document date, YYYY-MM-DD. Inclusive of the whole of that day. For a whole year use dateFrom 2019-01-01 and dateTo 2019-12-31." },
+              subjectId: { type: ["string", "null"], description: "Only files currently filed under this subject, INCLUDING everything nested beneath it. This narrows WHICH files move; it is not the destination. Omit it to match files wherever they are filed, which is usually what 'all my invoices' means." },
+              documentTypeId: { type: ["string", "null"], description: "Only files carrying this document type (the what-KIND-of-thing axis, independent of where a file is filed)." },
+              storageLocationId: { type: ["string", "null"], description: "Only files found in this registered storage location -- 'the old NAS', 'the external drive'." },
+              pathPrefix: { type: ["string", "null"], description: "Only files whose folder path inside their storage location starts with this, e.g. 'Archives/2019'." },
+              unfiled: { type: ["boolean", "null"], description: "true to match only files that are not filed under any subject yet -- the unsorted pile. Cannot be combined with subjectId." },
+            },
+          },
           subjectId: { type: ["string", "null"], description: "Required for rename_subject and delete_subject -- the subject being changed." },
           parentSubjectId: { type: ["string", "null"], description: "For create_subject -- the parent subject/category to nest under, or null for a new top-level Subject." },
           name: { type: ["string", "null"], description: "For create_subject (new name) and rename_subject (new name)." },
+          description: { type: ["string", "null"], description: "For create_subject -- one sentence saying what belongs in this folder, in the user's own terms. This is not decoration: the classifier reads it when deciding where future documents go, and it outranks the folder's name. Write what a person would need to know to file correctly -- 'Deeds and correspondence for the Haifa monastery, including anything mentioning Mount Carmel' is useful; 'Folder for Haifa Monastery' is not. Include exclusions when the user states them. Omit it only if the name is genuinely self-explanatory." },
           newFilename: { type: ["string", "null"], description: "For rename_file -- the new filename INCLUDING its extension, and never containing a path separator. Keep the original extension unless the user explicitly asks to change it." },
           fileIdA: { type: ["string", "null"], description: "For compare_files -- the first file, from the visible-files list." },
           fileIdB: { type: ["string", "null"], description: "For compare_files -- the second file, from the visible-files list. Must differ from fileIdA." },
@@ -80,11 +101,23 @@ that: on the Files page "this file" most likely means one they can see in the li
 Subjects page it probably means one under the selected subject. If the reference is
 genuinely ambiguous, ask rather than guess.
 
-The taxonomy is a strict 3-level hierarchy: Subject -> Category -> Subcategory. Files are
-never attached to the tree structurally -- each file has a "classification" pointing at
-exactly one subject/category/subcategory node, and "moving a file" or "moving a folder's
-contents" just means changing which node it points at. Nothing about the tree shape
-changes when files move.
+The folder tree is the USER'S, not a fixed taxonomy. They can nest as deep as they like
+(up to 12 levels, a guard rail against runaway nesting, not a shape you should design
+around), name folders anything, and delete or rename the six that shipped as defaults --
+Academic, Administrative, Finance, Legal, Personal, Reference are starting suggestions,
+not a structure to file everything into. If someone wants "Tables", "Boat stuff" or
+"2019 - Q3 - reconciled", help them build exactly that. Never talk the user back toward
+the default folders, and never tell them a folder "doesn't fit the taxonomy".
+
+Files are never attached to the tree structurally -- each file has a "classification"
+pointing at exactly one folder, and "moving a file" or "moving a folder's contents" just
+means changing which folder it points at. Nothing about the tree shape changes when files
+move.
+
+Document type is a SEPARATE, independent axis from where a file is filed. A file being of
+type Invoice does not mean it belongs in a folder called Invoices -- type says what KIND
+of thing a document is, the folder says where the user chose to keep it. Use type as a
+way to FIND files (a filter), never as a reason to file them somewhere.
 
 You will be given the full current subject tree (id, level, path, name) and whatever
 files are currently visible in the user's UI (id, filename, path). You can ONLY reference
@@ -113,10 +146,26 @@ Action types:
   to a different subject (this is what "move this folder into that subcategory" means --
   it does not restructure the tree, only reclassifies the files in it). Needs
   fromSubjectId, toSubjectId.
-- create_subject: create a new Subject (parentSubjectId: null), Category (parent is a
-  Subject), or Subcategory (parent is a Category). Needs name; parentSubjectId null only
-  for a brand-new top-level Subject. The hierarchy is exactly 3 levels deep -- never
-  propose creating a child under a Subcategory.
+- move_by_filter: file every document MATCHING CRITERIA into one folder, wherever those
+  documents currently sit. Needs filter and toSubjectId. This is the right action for
+  "put all my 2019 invoices in Archive/2019", "move everything from the old NAS into
+  Imported", "file every PDF in the unsorted pile under Documents" -- anything phrased as
+  a rule rather than as a list. Prefer it strongly over proposing many move_file actions:
+  it is one reviewable card instead of thousands, it runs as a background job the user can
+  watch, and it catches files that are not currently on screen. The filter uses the same
+  fields as the app's own filter bar (see the schema). Set only the fields the user
+  actually specified. If they asked for something the filter cannot express -- "all the
+  blurry ones", "anything about my mother" -- say so and offer find_files instead of
+  quietly approximating it with a filter that means something else.
+- create_subject: create a new folder anywhere in the tree. Needs name, plus
+  parentSubjectId (the folder to nest inside) or null for a new top-level folder. Nest as
+  deep as the user's structure calls for. When someone describes how they want to organize
+  things, propose the whole set of folders at once rather than one at a time.
+  ALSO write a "description" whenever the user has told you what goes in the folder. The
+  classifier reads it when filing future documents, so a sentence here is the difference
+  between a folder that fills itself and one the user has to fill by hand. Put what they
+  said into it -- if they tell you "invoices from suppliers, not client ones", that
+  distinction belongs in the description, not just in your reply.
 - rename_subject: change a subject's display name only. Needs subjectId, name.
 - compare_files: measure how similar two files' contents are, and report the percentage.
   Needs fileIdA and fileIdB, both from the visible-files list. This one only READS -- it
@@ -251,9 +300,32 @@ function buildInput({ message, history, subjectTree, visibleFiles, selectedSubje
     ? subjectTree.map((s) => `- id: ${s.id} | level: ${s.level} | path: ${s.materialized_path} | name: ${s.name}`).join("\n")
     : "(no subjects defined yet)";
 
+  /**
+   * One line per file, and the description is the half that matters.
+   *
+   * This line used to be id + filename + an always-empty path, which made the
+   * filename the only thing the model could reason about. On an archive whose
+   * files are called "WhatsApp Image 2026-07-29 at 20.17.33.jpeg" that is
+   * nothing: the assistant could find that file if you typed its WhatsApp name
+   * and not if you described what was in it, which is backwards from how
+   * anybody remembers a photo.
+   *
+   * Fields are omitted rather than emitted empty. A line reading `path:  |
+   * subject:` teaches the model that these are usually blank, and it starts
+   * ignoring them where they are not.
+   */
   const trimmedFiles = visibleFiles.slice(0, MAX_VISIBLE_FILES);
+  const fileLine = (f) => {
+    const parts = [`id: ${f.id}`, `filename: ${f.filename}`];
+    if (f.currentPath) parts.push(`path: ${f.currentPath}`);
+    if (f.subjectName) parts.push(`subject: ${f.subjectName}`);
+    if (f.waitingBecause) parts.push(`waiting: ${f.waitingBecause}`);
+    // Last, and labelled, because it is prose sitting in a pipe-delimited row.
+    if (f.description) parts.push(`description: ${f.description}`);
+    return `- ${parts.join(" | ")}`;
+  };
   const filesText = trimmedFiles.length
-    ? trimmedFiles.map((f) => `- id: ${f.id} | filename: ${f.filename} | path: ${f.currentPath || ""}`).join("\n")
+    ? trimmedFiles.map(fileLine).join("\n")
     : "(none currently visible in the UI -- if the user references a specific file, ask them to select its subject first)";
 
   const recentHistory = history.slice(-MAX_HISTORY_TURNS);
@@ -271,7 +343,13 @@ function buildInput({ message, history, subjectTree, visibleFiles, selectedSubje
 Current subject taxonomy (id | level | path | name):
 ${treeText}
 
-Files currently visible in the UI (id | filename | path)${selectedSubject ? ` -- under the currently selected subject "${selectedSubject.name}" (id: ${selectedSubject.id})` : ""}:
+Files you can act on${selectedSubject ? ` -- including those under the currently selected subject "${selectedSubject.name}" (id: ${selectedSubject.id})` : ""}.
+These are the documents matching the user's message, plus what is on screen and
+what is waiting to be filed. Each line gives an id and a filename, and where
+they are known, the folder path, the subject it is filed under, why it is
+waiting, and a DESCRIPTION of what the file actually contains. Most filenames
+in this archive are meaningless (camera and WhatsApp exports), so match the
+user's request against the description first and the filename second:
 ${filesText}
 
 Conversation so far:
@@ -443,6 +521,26 @@ function actionReferencesKnownIds(action, subjectIds, fileIds) {
         action.toSubjectId && subjectIds.has(action.toSubjectId) &&
         action.fromSubjectId !== action.toSubjectId
       );
+    case "move_by_filter": {
+      // The destination is the only id here that MUST be real, and it is
+      // checked against the tree we just supplied for the same reason every
+      // other case is: a hallucinated folder id would render as an Apply
+      // button that files thousands of documents somewhere that does not
+      // exist. `filter.subjectId` is checked too when present -- it narrows
+      // the set, so a wrong one silently moves a different set of files.
+      if (!action.toSubjectId || !subjectIds.has(action.toSubjectId)) return false;
+      const filter = action.filter;
+      if (!filter || typeof filter !== "object") return false;
+      if (filter.subjectId && !subjectIds.has(filter.subjectId)) return false;
+      // Filtering by a folder and filing into the same folder is a no-op the
+      // model sometimes proposes when the user says "tidy up Finance".
+      if (filter.subjectId && filter.subjectId === action.toSubjectId) return false;
+      // An empty filter means the whole repository. The server refuses it too,
+      // but a card that cannot possibly apply should never be offered.
+      const meaningful = ["ext", "dateFrom", "dateTo", "subjectId", "documentTypeId", "storageLocationId", "pathPrefix"]
+        .some((k) => filter[k] !== undefined && filter[k] !== null && String(filter[k]).trim() !== "");
+      return meaningful || filter.unfiled === true;
+    }
     case "create_subject":
       return Boolean(action.name) && (action.parentSubjectId ? subjectIds.has(action.parentSubjectId) : true);
     case "rename_subject":
@@ -454,4 +552,11 @@ function actionReferencesKnownIds(action, subjectIds, fileIds) {
   }
 }
 
-module.exports = { chat, GeminiChatError, ACTION_TYPES, READ_ONLY_ACTIONS, detectScript };
+// `buildInput` is exported for verification only. What reaches the model is
+// the one thing here with no other way to observe it, and the failure it hides
+// is silent by nature: the file line read `f.currentPath` while the controller
+// set `path`, so the location rendered as empty on every row for as long as
+// that mismatch existed, with nothing anywhere to say so. A field name is not
+// a contract until something checks it.
+// See scripts/verify-assistant-retrieval.js.
+module.exports = { chat, buildInput, GeminiChatError, ACTION_TYPES, READ_ONLY_ACTIONS, detectScript };

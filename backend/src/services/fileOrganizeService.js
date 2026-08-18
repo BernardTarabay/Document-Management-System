@@ -113,10 +113,13 @@ async function moveToSubject({
   // this" while its classification still points elsewhere is worse than
   // either failure alone.
   await db.withTransaction(async (client) => {
-    await classificationResultRepository.create({
+    // createPartial, not create: a move says where the document is FILED and
+    // nothing about what KIND of document it is. Passing null for the type
+    // here used to delete the type on every move, because downstream readers
+    // take the latest row. See the repository for the full story.
+    await classificationResultRepository.createPartial({
       fileId,
       classifiedSubjectId: subjectId,
-      classifiedDocumentTypeId: null,
       confidenceLevel: source === PlacementSource.USER ? ConfidenceLevel.HIGH : ConfidenceLevel.MEDIUM,
       confidenceScore: source === PlacementSource.USER ? 1.0 : 0.75,
       method: source === PlacementSource.USER ? ClassificationMethod.MANUAL : ClassificationMethod.LLM,

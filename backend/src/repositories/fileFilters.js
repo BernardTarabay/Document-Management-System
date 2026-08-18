@@ -31,6 +31,59 @@
 const { ValidationError } = require("../validators/validationError");
 const { requireOwner } = require("./ownership");
 
+/**
+ * What counts as a file the user is currently working with.
+ *
+ * Archive and Trash are lifecycle statuses (migration 037), so a file in either
+ * has to vanish from every ordinary listing, count and search -- not be styled
+ * differently, not appear with a badge. Written once here because the three
+ * queries that must agree about this (the listing, the count beside it, and the
+ * id sweep behind "select all") are in three different functions, and a
+ * definition repeated three times is a definition that will eventually differ
+ * three ways. That already happened once with `status != 'deleted'`, which is
+ * why "select all N" quietly selected fewer than N.
+ *
+ * Written against the alias `f`, like everything else in this module.
+ */
+const LISTABLE_STATUS = "f.status NOT IN ('deleted', 'archived')";
+
+/**
+ * Hide the losing copy of a duplicate the user has already settled.
+ *
+ * WHY THIS IS A DEFAULT AND NOT A FILTER
+ *
+ * Once a duplicate group is RESOLVED, a canonical copy has been chosen -- the
+ * question "which of these is the one I keep" has an answer. Continuing to list
+ * the other copies means a library of 16 documents reports 31, the same
+ * photograph appears twice in the grid, and every count is inflated by however
+ * many backup folders happen to be registered. The system knows they are the
+ * same document and shows them as two anyway.
+ *
+ * UNRESOLVED groups are deliberately untouched. Nobody has decided which copy
+ * is the keeper, so hiding one would be picking for them, silently.
+ *
+ * Nothing is deleted and nothing is hidden permanently: the Duplicates page
+ * lists every group, and the reclaimable-bytes figure is still built on all the
+ * copies. This governs only the views that answer "what documents do I have".
+ *
+ * This predicate already existed, written out by hand in seven separate
+ * queries, and was missing from every query the Library, the Photos grid and
+ * the dashboard actually read -- which is exactly how the two halves of the app
+ * came to disagree about how many documents there are. One definition now.
+ *
+ * Written against the alias `f`, like everything else here.
+ */
+const NOT_A_DUPLICATE_COPY = `NOT EXISTS (
+  SELECT 1 FROM duplicate_group_members dgm
+  JOIN duplicate_groups dg ON dg.id = dgm.duplicate_group_id
+  WHERE dgm.file_id = f.id
+    AND dg.canonical_file_id IS NOT NULL
+    AND dg.canonical_file_id <> f.id
+)`;
+
+/** What an ordinary "my documents" query means: live, and not a settled copy. */
+const LISTABLE_FILE = `${LISTABLE_STATUS} AND ${NOT_A_DUPLICATE_COPY}`;
+
 /** The sentinel for "files with no extension at all" -- see parseExtensions. */
 const NO_EXTENSION = "none";
 
@@ -91,6 +144,20 @@ function parseUuid(raw, label) {
 }
 
 /**
+ * A query-string boolean. Refused rather than coerced, for the same reason
+ * parseDate refuses "last tuesday": `Boolean("false")` is true, so a typo in
+ * a flag that HIDES most of the repository would silently do the opposite of
+ * what was asked.
+ */
+function parseBool(raw, label) {
+  if (raw === undefined || raw === null || raw === "") return false;
+  const value = String(raw).trim().toLowerCase();
+  if (["true", "1", "yes"].includes(value)) return true;
+  if (["false", "0", "no"].includes(value)) return false;
+  throw new ValidationError(`${label} must be true or false (got "${raw}").`);
+}
+
+/**
  * Query string -> a validated filter object, or a ValidationError explaining
  * exactly which parameter was wrong.
  *
@@ -107,9 +174,18 @@ function parseFileFilters(query = {}, ownerUserId) {
     dateFrom: parseDate(query.dateFrom, "dateFrom"),
     dateTo: parseDate(query.dateTo, "dateTo"),
     subjectId: parseUuid(query.subjectId, "subjectId"),
+    documentTypeId: parseUuid(query.documentTypeId, "documentTypeId"),
+    unfiled: parseBool(query.unfiled, "unfiled"),
     storageLocationId: parseUuid(query.storageLocationId, "storageLocationId"),
     pathPrefix: query.pathPrefix ? String(query.pathPrefix).trim() || null : null,
   };
+
+  // "Everything under Finance" and "everything filed nowhere" are contrary
+  // instructions, and the only ways to reconcile them are to return nothing
+  // or to quietly obey one of them. Both are worse than saying so.
+  if (filters.unfiled && filters.subjectId) {
+    throw new ValidationError("unfiled and subjectId cannot be combined — a file is either filed somewhere or nowhere.");
+  }
 
   // Caught here rather than returning an empty list with no explanation --
   // a reversed range is a typo every time, and "0 results" is the least
@@ -129,7 +205,8 @@ function hasAnyFilter(filters) {
   return Boolean(
     filters.extensions?.length ||
     filters.dateFrom || filters.dateTo ||
-    filters.subjectId || filters.storageLocationId || filters.pathPrefix
+    filters.subjectId || filters.documentTypeId || filters.unfiled ||
+    filters.storageLocationId || filters.pathPrefix
   );
 }
 
@@ -229,6 +306,54 @@ function buildFilterClauses(filters, startIndex = 1) {
     )`);
   }
 
+  /**
+   * Everything filed nowhere.
+   *
+   * This is the pile someone has after pointing Atlas at a drive full of
+   * twenty years of accumulated files, and until now it was the one set the
+   * app could count (the dashboard's `attention.unfiled`) but could not show
+   * you. A number you cannot click is a reproach, not a feature.
+   *
+   * Matches a file with NO classification row at all as well as one whose
+   * latest row names no subject -- both mean "nobody, human or machine, has
+   * said where this belongs", which is the question being asked.
+   */
+  if (filters?.unfiled) {
+    clauses.push(`NOT EXISTS (
+      SELECT 1
+        FROM (
+          SELECT cr.classified_subject_id
+            FROM classification_results cr
+           WHERE cr.file_id = f.id
+           ORDER BY cr.created_at DESC LIMIT 1
+        ) latest
+       WHERE latest.classified_subject_id IS NOT NULL
+    )`);
+  }
+
+  /**
+   * Document type: the second classification axis (docs/03-taxonomy.md §3.4).
+   *
+   * Flat, so unlike subject there is no descendant roll-up -- "Invoice" means
+   * Invoice, and that is the whole point of the axis. It reads the same latest
+   * row the subject filter does, which is only correct because every writer
+   * now goes through classificationResultRepository.createPartial and leaves a
+   * complete snapshot behind. Before that, a subject move wrote a newer row
+   * with a null type and this filter would have reported the file as untyped.
+   */
+  if (filters?.documentTypeId) {
+    clauses.push(`EXISTS (
+      SELECT 1
+        FROM (
+          SELECT cr.classified_document_type_id
+            FROM classification_results cr
+           WHERE cr.file_id = f.id
+           ORDER BY cr.created_at DESC LIMIT 1
+        ) latest
+       WHERE latest.classified_document_type_id = ${bind(filters.documentTypeId)}
+    )`);
+  }
+
   if (filters?.storageLocationId) {
     clauses.push(`f.storage_location_id = ${bind(filters.storageLocationId)}`);
   }
@@ -243,6 +368,80 @@ function buildFilterClauses(filters, startIndex = 1) {
   return { clauses, params };
 }
 
+/**
+ * Sorting, as a closed set.
+ *
+ * WHY A WHITELIST AND NOT A COLUMN NAME
+ *
+ * Every other value in this module travels as a bound parameter, but ORDER BY
+ * cannot be parameterised -- it has to be text in the SQL. So the only safe
+ * design is one where user input never becomes SQL at all: the request names a
+ * SORT, not a column, and the mapping from name to expression lives here. An
+ * unknown name falls back to the default rather than erroring, because a stale
+ * bookmark with an old sort key should show you your files, not a 400.
+ *
+ * The expressions are written against the `f` alias like the filter clauses.
+ * NULLS LAST on document_date is deliberate: sorting by date and getting a
+ * screen of undated files first is the least useful possible answer, and this
+ * archive has thousands of them (see the note on the date filter above).
+ */
+const SORTS = Object.freeze({
+  // The default everywhere before sorting existed, kept as the default so
+  // nothing reorders under anyone who never asks for a sort.
+  imported: "f.imported_at",
+  name: "COALESCE(NULLIF(f.ai_short_title, ''), f.filename_current)",
+  date: "f.document_date",
+  size: "f.size_bytes",
+  extension: "lower(f.extension)",
+});
+
+const DEFAULT_SORT = "imported";
+// Sorted newest/largest first, because for these that is the interesting end.
+const DESC_BY_DEFAULT = new Set(["imported", "date", "size"]);
+
+/**
+ * @returns {{sortBy: string, sortDir: 'ASC'|'DESC'}} always valid, never user text
+ */
+function parseSort(query = {}) {
+  const requested = String(query.sortBy || "").trim().toLowerCase();
+  const sortBy = Object.prototype.hasOwnProperty.call(SORTS, requested) ? requested : DEFAULT_SORT;
+
+  const dir = String(query.sortDir || "").trim().toLowerCase();
+  const sortDir = dir === "asc" ? "ASC" : dir === "desc" ? "DESC" : (DESC_BY_DEFAULT.has(sortBy) ? "DESC" : "ASC");
+
+  return { sortBy, sortDir };
+}
+
+/**
+ * The ORDER BY body for a parsed sort. Built only from the table above and the
+ * two literal direction strings, so there is no path by which a request value
+ * reaches the query text.
+ *
+ * `f.id` is appended as a tiebreaker on every sort. Without it, rows with
+ * equal values (all the undated files, all the 0-byte ones) have no defined
+ * order between them, and Postgres is free to return them differently on each
+ * page -- which shows up as a file appearing on page 2 and again on page 3
+ * while another is never seen at all. Pagination over a non-deterministic sort
+ * silently loses rows, and at a few thousand files nobody would notice.
+ */
+function buildOrderBy(sort) {
+  // Destructured in the body rather than in the signature: a `= {}` default
+  // only fires on `undefined`, and every caller in this repository defaults
+  // its own `sort` parameter to `null` (`listNotDeleted`, `listBySubject`),
+  // so `buildOrderBy(null)` threw a TypeError on what the signature advertised
+  // as an optional argument. The two production callers happen to always pass
+  // a parsed sort, which is the only reason this was not a live 500.
+  const { sortBy, sortDir } = sort || {};
+  const expr = SORTS[sortBy] || SORTS[DEFAULT_SORT];
+  const dir = sortDir === "ASC" ? "ASC" : "DESC";
+  // NULLS LAST in BOTH directions, which is not the SQL default and is the
+  // reason this is stated rather than left implicit: Postgres treats NULLs as
+  // larger than any value, so a DESC sort would lead with them. Sorting by
+  // date and getting a screen of undated files first is the least useful
+  // answer available, and this archive has thousands of them.
+  return `${expr} ${dir} NULLS LAST, f.id ${dir}`;
+}
+
 /** `buildFilterClauses` as a single `AND ...` string, or "" when empty. */
 function buildFilterSql(filters, startIndex = 1) {
   const { clauses, params } = buildFilterClauses(filters, startIndex);
@@ -250,9 +449,16 @@ function buildFilterSql(filters, startIndex = 1) {
 }
 
 module.exports = {
+  LISTABLE_STATUS,
+  NOT_A_DUPLICATE_COPY,
+  LISTABLE_FILE,
   NO_EXTENSION,
   MAX_EXTENSIONS,
+  SORTS,
+  DEFAULT_SORT,
   parseFileFilters,
+  parseSort,
+  buildOrderBy,
   hasAnyFilter,
   buildFilterClauses,
   buildFilterSql,

@@ -12,7 +12,7 @@ const documentTypeRepository = require("../repositories/documentTypeRepository")
 const auditLogRepository = require("../repositories/auditLogRepository");
 const { getStorageServiceFor } = require("./storage/storageService");
 const descriptionSearchService = require("./descriptionSearchService");
-const { parseFileFilters } = require("../repositories/fileFilters");
+const { parseFileFilters, parseSort, hasAnyFilter } = require("../repositories/fileFilters");
 const { renameToAvailableName } = require("../utils/resolveAvailableFilename");
 const { assertSafeFilename } = require("../utils/filenameSafety");
 const { resolveWithinRoot } = require("../utils/pathSafety");
@@ -24,6 +24,7 @@ const mime = require("../utils/mimeGuess");
 const thumbnailService = require("./preview/thumbnailService");
 const similarity = require("./similarityService");
 const fileOrganizeService = require("./fileOrganizeService");
+const { requireOwner } = require("../repositories/ownership");
 
 class NotFoundError extends Error {
   constructor(message) {
@@ -79,7 +80,36 @@ async function search(query, ownerUserId) {
   // Default view -- excludes 'deleted' so removed files (single or bulk)
   // actually disappear instead of lingering with a "deleted" badge. See
   // fileRepository.listNotDeleted for why this isn't the generic list().
-  return fileRepository.listNotDeleted({ limit, offset, filters });
+  //
+  // Sorting applies only here, not to the search branches above: a ranked
+  // search is already sorted, by relevance, and re-sorting it by size would
+  // throw away the ranking that made the results worth showing.
+  return fileRepository.listNotDeleted({ limit, offset, filters, sort: parseSort(query) });
+}
+
+/**
+ * The ids of everything matching the current scope and filters, for
+ * "select all N".
+ *
+ * Returns `{ ids, capped }`. `capped` is the honest half: when the match set
+ * is larger than the cap the caller is told, so the UI can say "the first
+ * 5,000 of 12,400" rather than presenting a truncated set as if it were
+ * everything. A bulk action that files a silently-different set from the one
+ * the user asked for is the worst outcome available here.
+ */
+const MAX_SELECTABLE_IDS = 5000;
+
+async function matchingIds(query, ownerUserId, { subjectId = null } = {}) {
+  const filters = parseFileFilters(query, ownerUserId);
+  // One over the cap, so "is there more than the cap" is answerable without a
+  // second counting query.
+  const ids = await fileRepository.idsMatching({
+    filters,
+    subjectId,
+    limit: MAX_SELECTABLE_IDS + 1,
+  });
+  const capped = ids.length > MAX_SELECTABLE_IDS;
+  return { ids: capped ? ids.slice(0, MAX_SELECTABLE_IDS) : ids, capped, cap: MAX_SELECTABLE_IDS };
 }
 
 /**
@@ -511,14 +541,18 @@ async function updateFile(fileId, { filename, subjectId, documentTypeId, confirm
     }
 
     // A document TYPE is orthogonal to a subject (docs/03-taxonomy.md §3.4)
-    // and carries no duplicate implications, so it is still written here --
-    // but only when it is the thing that actually changed, or the subject
-    // move above would be immediately overwritten by a second row naming no
-    // subject at all.
-    if (documentTypeId !== undefined && !subjectId) {
-      await classificationResultRepository.create({
+    // and carries no duplicate implications, so it is written here rather than
+    // going through the move path.
+    //
+    // This used to be gated on `!subjectId`, because writing the type wrote a
+    // second row naming no subject at all, which immediately overwrote the
+    // move above. The gate meant setting a subject and a type in one request
+    // silently discarded the type -- and orthogonal axes you cannot set
+    // together are not orthogonal. createPartial carries the subject the move
+    // just wrote, so both can be set at once and neither erases the other.
+    if (documentTypeId !== undefined) {
+      await classificationResultRepository.createPartial({
         fileId,
-        classifiedSubjectId: null,
         classifiedDocumentTypeId: documentTypeId || null,
         confidenceLevel: ConfidenceLevel.HIGH,
         confidenceScore: 1.0,
@@ -616,8 +650,99 @@ function revealPathOnHostOS(absolutePath) {
   });
 }
 
+/**
+ * File several documents under one subject, from the Library.
+ *
+ * Thin on purpose. The bulk filing implementation already exists --
+ * fileOrganizeService.moveManyToSubject, which the Photos and Triage pages
+ * have been calling all along -- and it already loops the single-file path so
+ * every duplicate check, ownership check and audit entry applies per file.
+ * Writing a second one here would be exactly the "four callers, four
+ * implementations" failure that module's header warns about, and the fourth
+ * one is always the one that forgets a check.
+ *
+ * What this adds is the entry point: the Library needs to file a selection
+ * that came from anywhere (an unfiled pile, a subject, a search), not only
+ * from the photo grid or the triage queue.
+ */
+async function moveMany(fileIds, subjectId, actorUserId, { confirmDuplicates = false } = {}) {
+  requireOwner(actorUserId, "fileService.moveMany");
+  if (!subjectId) throw new ValidationError("Choose a folder to file these into.");
+
+  return fileOrganizeService.moveManyToSubject({
+    fileIds,
+    subjectId,
+    ownerUserId: actorUserId,
+    source: fileOrganizeService.PlacementSource.USER,
+    confirmDuplicates,
+  });
+}
+
+/**
+ * File everything matching a filter under one subject, as a background job.
+ *
+ * The counterpart to moveMany: that one takes a list of ids the user assembled
+ * by hand, this one takes the CRITERIA and finds them. "Every PDF from 2019
+ * under the old NAS" is not a selection anybody can realistically tick at this
+ * scale, and it is the shape of instruction the assistant receives in plain
+ * language.
+ *
+ * Returns the job, not a result. The work happens in bulkMoveProcessor, which
+ * re-parses and re-validates the filter itself -- the payload carries the raw
+ * query shape rather than a parsed object so that what is stored in
+ * processing_jobs is the same vocabulary the UI sends and a human can read.
+ *
+ * Validated HERE as well, before enqueuing, because a filter that is going to
+ * be refused should be refused while the user is still looking at the sentence
+ * that produced it, not silently in a worker minutes later.
+ */
+async function moveByFilter(query, toSubjectId, actorUserId, { confirmDuplicates = false } = {}) {
+  requireOwner(actorUserId, "fileService.moveByFilter");
+  if (!toSubjectId) throw new ValidationError("Choose a folder to file these into.");
+
+  const subject = await subjectRepository.findByIdForOwner(toSubjectId, actorUserId);
+  if (!subject) throw new NotFoundError("Subject not found.");
+
+  // Throws on anything malformed, in the caller's own request.
+  const filters = parseFileFilters(query || {}, actorUserId);
+
+  // A filter naming no criteria at all matches the entire repository. That is
+  // a legitimate thing to want ("put everything in Inbox") and a catastrophic
+  // thing to do by accident, so it has to be asked for explicitly rather than
+  // arrived at by an empty object.
+  if (!hasAnyFilter(filters) && !query?.all) {
+    throw new ValidationError(
+      "That would move every file in the repository. Add a filter, or pass all=true if that is really what you want."
+    );
+  }
+
+  // Sized upfront so Processing Jobs shows real X/Y progress rather than "—".
+  const total = await fileRepository.countMatching({ filters });
+
+  const job = await enqueueJob(
+    JobType.BULK_MOVE,
+    { filters: query, toSubjectId, actorUserId, ownerUserId: actorUserId, confirmDuplicates },
+    { createdBy: actorUserId, ownerUserId: actorUserId, progressTotal: total }
+  );
+
+  await auditLogRepository.record({
+    userId: actorUserId,
+    action: "file.move_by_filter.queued",
+    entityType: "processing_job",
+    entityId: job.id,
+    newState: { filters: query, toSubjectId, matched: total },
+    reason: `Queued filing ${total} matching file(s) into "${subject.name}"`,
+  });
+
+  return { job, matched: total, destination: subject.name };
+}
+
 module.exports = {
   NotFoundError,
+  moveMany,
+  moveByFilter,
+  matchingIds,
+  MAX_SELECTABLE_IDS,
   search,
   count,
   filterOptions,

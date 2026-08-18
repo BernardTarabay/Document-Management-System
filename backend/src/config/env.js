@@ -62,6 +62,18 @@ const env = {
   databaseUrl: required("DATABASE_URL"),
   pgSsl: process.env.PGSSL === "true",
 
+  /**
+   * How long Trash holds a document before it is removed for good.
+   *
+   * A window, not a setting to tune for performance: it is the period in which
+   * "I did not mean that" is still recoverable. Thirty days is the same promise
+   * most desktop recycle bins make, which matters because that is the
+   * expectation people arrive with.
+   */
+  trash: {
+    retentionDays: Math.max(1, parseInt(process.env.TRASH_RETENTION_DAYS || "30", 10) || 30),
+  },
+
   jwt: {
     accessSecret: secret("JWT_ACCESS_SECRET"),
     refreshSecret: secret("JWT_REFRESH_SECRET"),

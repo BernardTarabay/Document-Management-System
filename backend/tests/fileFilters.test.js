@@ -13,6 +13,7 @@ const assert = require("node:assert");
 
 const {
   parseFileFilters, hasAnyFilter, buildFilterClauses, buildFilterSql, escapeLike, MAX_EXTENSIONS,
+  parseSort, buildOrderBy, SORTS, DEFAULT_SORT,
 } = require("../src/repositories/fileFilters");
 
 const UUID_A = "11111111-2222-3333-4444-555555555555";
@@ -167,6 +168,126 @@ test("the subject filter includes descendants, latest-classification-wins", () =
     "picking a parent must include its categories");
   assert.match(sql, /ORDER BY cr\.created_at DESC LIMIT 1/,
     "a reclassified file belongs where it is now, not everywhere it has been");
+});
+
+test("the document type filter is exact, with no descendant rollup", () => {
+  // Document types are flat by design (docs/03-taxonomy.md §3.4) -- the whole
+  // reason the axis exists is that "Report" must not have to live under
+  // Finance, Academic and Administrative at once. So unlike the subject
+  // filter, picking Invoice means Invoice and nothing else.
+  const { clauses } = withoutOwner(buildFilterClauses(parseFileFilters({ documentTypeId: UUID_A }, OWNER)));
+  const sql = clauses[0];
+  assert.match(sql, /classified_document_type_id/);
+  assert.match(sql, /ORDER BY cr\.created_at DESC LIMIT 1/,
+    "the type a file has now, not every type it has ever been given");
+  assert.ok(!sql.includes("materialized_path"), "a flat axis must not roll up");
+});
+
+test("document type and subject can be filtered together", () => {
+  // The two axes are orthogonal, so "every Invoice under Finance" has to be
+  // expressible. If these ever collapsed into one clause, one of them would
+  // be silently winning.
+  const { clauses, params } = withoutOwner(buildFilterClauses(
+    parseFileFilters({ subjectId: UUID_A, documentTypeId: UUID_B }, OWNER)
+  ));
+  assert.equal(clauses.length, 2);
+  assert.ok(params.includes(UUID_A) && params.includes(UUID_B));
+});
+
+test("a junk documentTypeId is a 400, not a silently dropped filter", () => {
+  assert.throws(() => parseFileFilters({ documentTypeId: "not-a-uuid" }, OWNER), /valid id/);
+  assert.equal(hasAnyFilter(parseFileFilters({ documentTypeId: UUID_A }, OWNER)), true);
+});
+
+// --- sorting ---------------------------------------------------------------
+//
+// ORDER BY cannot be parameterised, so unlike every other value in this module
+// a sort has to become SQL TEXT. That makes this the one place where getting
+// it wrong is an injection rather than a wrong answer, which is why the
+// request names a sort and never a column.
+
+test("an unknown sort falls back to the default instead of reaching SQL", () => {
+  const { sortBy } = parseSort({ sortBy: "f.size_bytes; DROP TABLE files" });
+  assert.equal(sortBy, DEFAULT_SORT);
+  const sql = buildOrderBy(parseSort({ sortBy: "f.size_bytes; DROP TABLE files" }));
+  assert.ok(!sql.includes("DROP"), "request text must never appear in the ORDER BY");
+  assert.ok(!sql.includes(";"), "no statement separator can survive the whitelist");
+});
+
+test("every whitelisted sort produces SQL built only from the table", () => {
+  for (const name of Object.keys(SORTS)) {
+    const sql = buildOrderBy(parseSort({ sortBy: name }));
+    assert.ok(sql.includes(SORTS[name]), `${name} should sort by its mapped expression`);
+    assert.match(sql, /(ASC|DESC)/);
+  }
+});
+
+test("a junk direction cannot inject either", () => {
+  const sql = buildOrderBy(parseSort({ sortBy: "name", sortDir: "ASC; DELETE FROM files" }));
+  assert.ok(!sql.includes("DELETE"));
+  // Unrecognised direction falls back to the sort's natural one.
+  assert.match(sql, /ASC|DESC/);
+});
+
+test("every sort is total, so pagination cannot lose or repeat rows", () => {
+  // Thousands of files share a size, an extension, or no date at all. With no
+  // tiebreaker their relative order is undefined and Postgres may return them
+  // differently per page -- a file shows up on page 2 and page 3 while another
+  // is never seen. At this scale nobody would notice.
+  for (const name of Object.keys(SORTS)) {
+    assert.match(buildOrderBy(parseSort({ sortBy: name })), /f\.id (ASC|DESC)$/,
+      `${name} must break ties on a unique column`);
+  }
+});
+
+test("dates and sizes default to newest/largest first, names to A-Z", () => {
+  assert.match(buildOrderBy(parseSort({ sortBy: "date" })), /DESC/);
+  assert.match(buildOrderBy(parseSort({ sortBy: "size" })), /DESC/);
+  assert.match(buildOrderBy(parseSort({ sortBy: "name" })), /ASC/);
+});
+
+test("undated files sort last rather than first", () => {
+  // Sorting by date and getting a screen of files with no known date is the
+  // least useful possible answer; this archive has thousands of them.
+  assert.match(buildOrderBy(parseSort({ sortBy: "date", sortDir: "desc" })), /NULLS LAST/);
+  assert.match(buildOrderBy(parseSort({ sortBy: "date", sortDir: "asc" })), /NULLS LAST/);
+});
+
+// --- the unfiled pile ------------------------------------------------------
+
+test("the unfiled filter matches files with no subject AND files with no classification at all", () => {
+  const { clauses } = withoutOwner(buildFilterClauses(parseFileFilters({ unfiled: "true" }, OWNER)));
+  const sql = clauses[0];
+  assert.match(sql, /NOT EXISTS/, "unfiled is the absence of a filing, not a value to match");
+  assert.match(sql, /ORDER BY cr\.created_at DESC LIMIT 1/);
+  // A file that was never classified has no row at all; NOT EXISTS over the
+  // latest-row subquery covers both that and a latest row naming no subject.
+  assert.match(sql, /classified_subject_id IS NOT NULL/);
+});
+
+test("unfiled and subjectId together is a 400, not a silent empty list", () => {
+  assert.throws(
+    () => parseFileFilters({ unfiled: "true", subjectId: UUID_A }, OWNER),
+    /cannot be combined/
+  );
+});
+
+test("a junk unfiled value is refused rather than coerced", () => {
+  // Boolean("false") is true. A typo in a flag that hides most of the
+  // repository must not silently do the opposite of what was asked.
+  assert.throws(() => parseFileFilters({ unfiled: "maybe" }, OWNER), /must be true or false/);
+  assert.equal(parseFileFilters({ unfiled: "false" }, OWNER).unfiled, false);
+  assert.equal(parseFileFilters({}, OWNER).unfiled, false);
+  assert.equal(hasAnyFilter(parseFileFilters({ unfiled: "true" }, OWNER)), true);
+});
+
+test("unfiled composes with the other filters", () => {
+  // "Everything unfiled, from 2019, that's a PDF" is the actual triage
+  // question -- unfiled has to narrow alongside the rest, not replace them.
+  const { clauses } = withoutOwner(buildFilterClauses(
+    parseFileFilters({ unfiled: "1", ext: "pdf", dateFrom: "2019-01-01" }, OWNER)
+  ));
+  assert.equal(clauses.length, 3);
 });
 
 test("files with no extension are reachable via the 'none' sentinel", () => {

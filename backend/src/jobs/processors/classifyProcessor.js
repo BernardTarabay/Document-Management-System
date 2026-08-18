@@ -16,6 +16,7 @@ const { enqueueJob } = require("../../queues");
 const { ConfidenceLevel, ClassificationMethod, JobType } = require("../../models/enums");
 const env = require("../../config/env");
 const geminiClassifier = require("../../services/ai/geminiClassifier");
+const taxonomyMatcher = require("../../services/taxonomyMatcher");
 
 const CONFIDENCE_ORDER = { low: 0, medium: 1, high: 2 };
 
@@ -116,10 +117,17 @@ async function runAiEscalation({ file, bodyText, allSubjects, allDocTypes, embed
       embeddedTitle,
     });
 
-    await classificationResultRepository.create({
+    // `?.id` without a `|| null` fallback on purpose: it yields undefined when
+    // the model declined to pick, and createPartial reads undefined as "not
+    // speaking to this axis". The prompt explicitly tells the model to answer
+    // null rather than force a bad match, so declining is the DESIGNED
+    // behaviour and happens often -- writing that null through would have let
+    // the AI tier erase a type a human had set by hand. "I don't know" is not
+    // "it is nothing".
+    await classificationResultRepository.createPartial({
       fileId: file.id,
-      classifiedSubjectId: classified.subject?.id || null,
-      classifiedDocumentTypeId: classified.documentType?.id || null,
+      classifiedSubjectId: classified.subject?.id,
+      classifiedDocumentTypeId: classified.documentType?.id,
       confidenceLevel: classified.confidenceLevel,
       confidenceScore: { low: 0.3, medium: 0.6, high: 0.9 }[classified.confidenceLevel],
       method: ClassificationMethod.LLM,
@@ -127,6 +135,11 @@ async function runAiEscalation({ file, bodyText, allSubjects, allDocTypes, embed
         shortTitle: classified.shortTitle,
         summary: classified.summary,
         entities: classified.entities,
+        // The model's literal taxonomy picks, stored whether or not they
+        // resolved -- see geminiClassifier.classify. A code that does not
+        // match the candidate list is a prompt/seed-data problem worth
+        // seeing, not something to drop on the floor.
+        picks: classified.picks,
         usage: classified.usage,
         interactionId: classified.interactionId,
       },
@@ -178,18 +191,10 @@ async function runAiEscalation({ file, bodyText, allSubjects, allDocTypes, embed
   }
 }
 
-function scoreKeywordMatches(haystack, keywords) {
-  let matches = 0;
-  const matched = [];
-  for (const kw of keywords) {
-    if (!kw) continue;
-    if (haystack.includes(kw.toLowerCase())) {
-      matches += 1;
-      matched.push(kw);
-    }
-  }
-  return { matches, matched };
-}
+// Keyword scoring lives in services/taxonomyMatcher.js: it is pure, it is the
+// part that was silently wrong for the whole document-type axis, and it is now
+// unit-tested (tests/taxonomyMatcher.test.js) rather than only reachable
+// through a job that needs Postgres and Redis to run.
 
 async function handle({ fileId }) {
   const file = await fileRepository.findById(fileId);
@@ -200,7 +205,21 @@ async function handle({ fileId }) {
   const [metadata, content, allSubjects, allDocTypes] = await Promise.all([
     fileMetadataRepository.findByFile(fileId),
     fileContentRepository.findByFile(fileId),
-    subjectRepository.list({ limit: 1000 }),
+    // THIS USER'S folders, not every folder in the database.
+    //
+    // Was `subjectRepository.list({ limit: 1000 })`, which is the base
+    // repository's unscoped `SELECT * FROM subjects LIMIT 1000`. Subjects are
+    // per-account (they carry owner_user_id), so on any instance with more
+    // than one user that offered every account's folders as candidates for
+    // every file: one person's document could be classified into another
+    // person's folder, and their folder names were sent to Gemini inside a
+    // stranger's prompt. Latent on a single-user install and a data leak on
+    // any other -- and it gets worse the moment folders carry descriptions,
+    // which is exactly what the line below now sends.
+    //
+    // Document types are deliberately NOT scoped: that table has no
+    // owner_user_id. They are a shared vocabulary, not personal folders.
+    subjectRepository.listForOwnerTree(file.owner_user_id),
     documentTypeRepository.list({ limit: 1000 }),
   ]);
 
@@ -217,41 +236,51 @@ async function handle({ fileId }) {
 
   // Filename matches count more -- a match in the name itself is much
   // stronger signal than an incidental word appearing somewhere in the body.
-  let bestSubject = null;
-  let bestSubjectScore = 0;
-  let bestSubjectInFilename = false;
-  for (const subject of allSubjects) {
-    const keywords = [subject.name, subject.slug];
-    const filenameHit = scoreKeywordMatches(filenameText, keywords);
-    const bodyHit = scoreKeywordMatches(bodyText, keywords);
-    const score = filenameHit.matches * 3 + bodyHit.matches;
-    if (score > bestSubjectScore) {
-      bestSubjectScore = score;
-      bestSubject = subject;
-      bestSubjectInFilename = filenameHit.matches > 0;
-    }
-  }
+  const subjectMatch = taxonomyMatcher.bestMatch(allSubjects, { filenameText, bodyText });
 
-  let bestDocType = null;
-  let bestDocTypeScore = 0;
-  let bestDocTypeInFilename = false;
-  for (const docType of allDocTypes) {
-    const keywords = [docType.name, docType.code].flatMap((k) => k.split(/(?=[A-Z])/)); // split "AnnualBudget" -> ["Annual","Budget"]
-    const filenameHit = scoreKeywordMatches(filenameText, keywords);
-    const bodyHit = scoreKeywordMatches(bodyText, keywords);
-    const score = filenameHit.matches * 3 + bodyHit.matches;
-    if (score > bestDocTypeScore) {
-      bestDocTypeScore = score;
-      bestDocType = docType;
-      bestDocTypeInFilename = filenameHit.matches > 0;
-    }
-  }
+  /**
+   * DOCUMENT TYPE IS NOT READ FROM THE BODY TEXT. This is the asymmetry that
+   * makes the axis mean anything, and it is not an oversight.
+   *
+   * Subject asks "what is this about", and prose answers that honestly -- a
+   * document that discusses budgets at length probably is about Finance.
+   * Document type asks "what KIND of thing is this" (docs/03-taxonomy.md
+   * §3.4), and prose does not answer that at all. The narrative that broke
+   * this axis says "presentation" four times, every one of them about a person
+   * giving one. Word-boundary matching does not help: the words are real
+   * words, correctly matched, and the conclusion is still wrong. There is no
+   * lexical rule that separates "mentions a presentation" from "is a
+   * presentation", so the rule tier stops guessing and leaves the axis to the
+   * two signals that can actually carry it -- the filename a person chose, and
+   * an extension that settles the question outright -- plus the AI tier, which
+   * reads the document, and a human, who can set it from the Files page.
+   *
+   * Consequence, stated plainly: the rule tier now assigns FEWER types. On a
+   * French/Arabic corpus with an English seed list it will usually assign
+   * none. An empty axis is recoverable; an axis full of confident nonsense
+   * teaches people not to trust the filter, which is not.
+   */
+  const docTypeMatch = taxonomyMatcher.bestMatch(allDocTypes, { filenameText, bodyText: "" });
+  const extensionType = taxonomyMatcher.typeFromExtension(file.extension, allDocTypes);
+
+  const bestSubject = subjectMatch.entity;
+  const bestSubjectScore = subjectMatch.score;
+  const bestSubjectInFilename = subjectMatch.inFilename;
+
+  // The extension outranks the filename keyword: "quarterly-report.pptx" is a
+  // Presentation that happens to contain a report, and the container is the
+  // thing the type axis names.
+  const bestDocType = extensionType || docTypeMatch.entity;
+  const bestDocTypeScore = extensionType ? 3 : docTypeMatch.score;
+  const bestDocTypeInFilename = Boolean(extensionType) || docTypeMatch.inFilename;
 
   if (!bestSubject && !bestDocType) {
-    const result = await classificationResultRepository.create({
+    // Carries both axes forward rather than nulling them: "the keyword tier
+    // recognised nothing" is a statement about the keyword tier, not about the
+    // file. Re-running classification on a file a human had already filed and
+    // typed must not quietly undo that work.
+    const result = await classificationResultRepository.createPartial({
       fileId,
-      classifiedSubjectId: null,
-      classifiedDocumentTypeId: null,
       confidenceLevel: ConfidenceLevel.LOW,
       confidenceScore: 0,
       method: ClassificationMethod.RULE,
@@ -289,16 +318,31 @@ async function handle({ fileId }) {
       : ConfidenceLevel.LOW;
   const confidenceScore = Math.min(0.99, totalScore / 10);
 
-  const result = await classificationResultRepository.create({
+  const result = await classificationResultRepository.createPartial({
     fileId,
-    classifiedSubjectId: bestSubject?.id || null,
-    classifiedDocumentTypeId: bestDocType?.id || null,
+    // undefined where there was no match, so an axis this pass says nothing
+    // about keeps its current value instead of being cleared.
+    classifiedSubjectId: bestSubject?.id,
+    classifiedDocumentTypeId: bestDocType?.id,
     confidenceLevel,
     confidenceScore,
     method: ClassificationMethod.RULE,
     rawOutput: {
-      subjectMatch: bestSubject ? { id: bestSubject.id, name: bestSubject.name, score: bestSubjectScore } : null,
-      documentTypeMatch: bestDocType ? { id: bestDocType.id, code: bestDocType.code, score: bestDocTypeScore } : null,
+      // `terms` is what actually matched. Without it a stored score of 2 is
+      // unfalsifiable after the fact -- which is how "Book" survived on the
+      // strength of "playbook" until someone went looking for the text.
+      subjectMatch: bestSubject
+        ? { id: bestSubject.id, name: bestSubject.name, score: bestSubjectScore, terms: subjectMatch.matchedTerms }
+        : null,
+      documentTypeMatch: bestDocType
+        ? {
+            id: bestDocType.id,
+            code: bestDocType.code,
+            score: bestDocTypeScore,
+            source: extensionType ? "extension" : "filename",
+            terms: extensionType ? [file.extension] : docTypeMatch.matchedTerms,
+          }
+        : null,
       matchedInFilename: inFilename,
     },
   });

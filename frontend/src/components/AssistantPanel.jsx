@@ -4,7 +4,7 @@ import {
   Bot, User, Sparkles, Mic, MicOff, GitCompare, CheckCheck, ListX, Copy, Search, MapPin,
 } from "lucide-react";
 import { api } from "../services/apiClient";
-import { useAssistant } from "../context/AssistantContext";
+import { useAssistant, useAssistantAsk } from "../context/AssistantContext";
 import { useToast } from "../context/ToastContext";
 import { SearchSnippet } from "./SearchSnippet";
 
@@ -22,6 +22,7 @@ const ACTION_ICONS = {
   reject_proposals: ListX,
   resolve_duplicates: Copy,
   move_subject_contents: FolderInput,
+  move_by_filter: FolderInput,
   create_subject: Plus,
   rename_subject: Pencil,
   delete_subject: Trash2,
@@ -70,6 +71,27 @@ export function AssistantPanel() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [listening, setListening] = useState(false);
+
+  const inputRef = useRef(null);
+  /**
+   * Another part of the app handing the user into a conversation -- the
+   * Library's empty state, which has nothing to show a new account and every
+   * reason to start them talking instead. Opens the panel and prefills the
+   * sentence; deliberately does NOT send it, so the first thing the assistant
+   * sees is something the user actually wrote.
+   */
+  useAssistantAsk((text) => {
+    setOpen(true);
+    setInput(text);
+    // After the panel has rendered, so the field exists to focus.
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      // Caret at the end -- these are sentence openers meant to be continued.
+      el.setSelectionRange?.(text.length, text.length);
+    });
+  });
 
   const scrollRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -240,6 +262,21 @@ export function AssistantPanel() {
         await bulkMoveSubjectContents(action.fromSubjectId, action.toSubjectId, (done, total) =>
           updateAction(messageIndex, actionIndex, { _status: "applying", _progress: `${done}/${total}` })
         );
+      } else if (action.type === "move_by_filter") {
+        // One request, not a client-side loop. move_subject_contents pages
+        // through its files from the browser, which is tolerable for one
+        // folder and not for a filter that can match the whole archive -- so
+        // this hands the criteria to the server and gets back a job to watch.
+        const res = await api.post("/files/move-by-filter", {
+          filters: action.filter,
+          toSubjectId: action.toSubjectId,
+        });
+        updateAction(messageIndex, actionIndex, {
+          _result:
+            res.matched === 0
+              ? "Nothing matched those criteria — no files were touched."
+              : `Filing ${res.matched.toLocaleString()} file${res.matched === 1 ? "" : "s"} into ${res.destination} — watch Processing Jobs for progress.`,
+        });
       } else if (action.type === "rename_file") {
         // The same endpoint the Edit dialog uses -- on a read-only location
         // this records the canonical name rather than touching the original.
@@ -270,7 +307,15 @@ export function AssistantPanel() {
           _result: "Resolving exact duplicates — watch Processing Jobs for progress.",
         });
       } else if (action.type === "create_subject") {
-        await api.post("/subjects", { parentId: action.parentSubjectId || null, name: action.name });
+        // The description travels with it. Without this the assistant can write
+        // a perfectly good "what belongs here" sentence and it is dropped on
+        // the floor at Apply time -- and that sentence is what the classifier
+        // reads when filing everything that arrives later.
+        await api.post("/subjects", {
+          parentId: action.parentSubjectId || null,
+          name: action.name,
+          description: action.description || null,
+        });
       } else if (action.type === "rename_subject") {
         await api.patch(`/subjects/${action.subjectId}`, { name: action.name });
       } else if (action.type === "delete_subject") {
@@ -440,6 +485,7 @@ export function AssistantPanel() {
               </button>
             )}
             <input
+              ref={inputRef}
               className="input flex-1"
               placeholder={listening ? "Listening…" : "Ask about your documents…"}
               value={input}

@@ -17,7 +17,7 @@
 const db = require("../config/database");
 const { createBaseRepository } = require("./baseRepository");
 const { tsQueryExpression } = require("./fileContentRepository");
-const { buildFilterSql } = require("./fileFilters");
+const { buildFilterSql, buildOrderBy, LISTABLE_STATUS, NOT_A_DUPLICATE_COPY, LISTABLE_FILE } = require("./fileFilters");
 const { requireOwner, ownedRepository } = require("./ownership");
 
 const base = createBaseRepository("files");
@@ -288,6 +288,7 @@ async function listPhotos(ownerUserId, { status = null, limit = 60, offset = 0 }
        LEFT JOIN file_ocr o ON o.file_id = f.id
       WHERE f.owner_user_id = $1
         AND f.status = 'active'
+        AND ${NOT_A_DUPLICATE_COPY}
         AND (f.is_image = true OR f.ocr_status <> 'not_needed')
         AND ($4::text IS NULL OR f.ocr_status::text = $4)
       ORDER BY (f.user_resolved_at IS NULL) DESC, f.imported_at DESC
@@ -303,6 +304,7 @@ async function countPhotos(ownerUserId, { status = null } = {}) {
     `SELECT count(*)::int AS count FROM files f
       WHERE f.owner_user_id = $1
         AND f.status = 'active'
+        AND ${NOT_A_DUPLICATE_COPY}
         AND (f.is_image = true OR f.ocr_status <> 'not_needed')
         AND ($2::text IS NULL OR f.ocr_status::text = $2)`,
     [ownerUserId, status]
@@ -721,7 +723,7 @@ async function searchEverything(query, { limit = 50, offset = 0, subjectId = nul
                  OR f.ai_summary ILIKE '%' || $1 || '%') AS matched_ai
        FROM files f
        LEFT JOIN file_content fc ON fc.file_id = f.id
-       WHERE f.status <> 'deleted'
+       WHERE ${LISTABLE_FILE}
        ${subjectFilter}
        ${filterSql.sql}
      )
@@ -830,21 +832,115 @@ const FILE_DECORATION_COLUMNS = `
   END AS naming_state
 `;
 
-async function listNotDeleted({ limit = 50, offset = 0, filters = null } = {}) {
+async function listNotDeleted({ limit = 50, offset = 0, filters = null, sort = null } = {}) {
   // Filters apply here, not only to search. "Every PDF from 2019" contains no
   // search term, and a filter bar that goes dead the moment you clear the
   // search box is a filter bar that does not work.
   const { sql, params } = buildFilterSql(filters, 1);
+  const orderBy = buildOrderBy(sort);
   const { rows } = await db.query(
     `SELECT f.*, ${FILE_DECORATION_COLUMNS}
      FROM files f
      ${FILE_DECORATION}
-     WHERE f.status != 'deleted'
+     WHERE ${LISTABLE_FILE}
      ${sql}
-     ORDER BY f.imported_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+     ORDER BY ${orderBy} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
     [...params, limit, offset]
   );
   return rows;
+}
+
+/**
+ * How many files sit directly under a subject, under the current filters.
+ *
+ * Deliberately the same eligibility rules as listBySubject -- active only,
+ * losing copies of resolved duplicate groups excluded, exact subject match
+ * rather than descendant-inclusive. A total that counted a different set from
+ * the list it labels is worse than no total.
+ */
+async function countInSubject(subjectId, { filters = null } = {}) {
+  const { sql, params } = buildFilterSql(filters, 2);
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS count
+       FROM files f
+       JOIN LATERAL (
+         SELECT classified_subject_id FROM classification_results cr
+         WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
+       ) latest ON true
+      WHERE latest.classified_subject_id = $1 AND f.status = 'active'
+        AND ${NOT_A_DUPLICATE_COPY}
+      ${sql}`,
+    [subjectId, ...params]
+  );
+  return rows[0]?.count || 0;
+}
+
+/**
+ * Just the ids matching a filter set, for "select all 1,240".
+ *
+ * A selection UI that can only ever tick what is on screen makes filing a real
+ * backlog into sixty page-selects, which is the point at which people give up
+ * and the archive stays a mess. This is the cheap half of fixing that: ids
+ * only, no decoration joins, capped.
+ *
+ * The cap is a real limit and not a formality -- the caller is told when it
+ * bites (see fileService.matchingIds) rather than silently receiving a
+ * truncated selection, because "select all" that quietly means "select the
+ * first five thousand" is how a bulk action files the wrong set.
+ *
+ * ELIGIBILITY FOLLOWS THE LIST BEING SELECTED FROM, AND THE TWO LISTS DIFFER
+ *
+ * "Select all" has exactly one job: end up with the set the user is looking
+ * at. So the rule here cannot be a rule of its own -- it has to be whichever
+ * rule drew the rows on screen, and this application has two:
+ *
+ *   in a subject   listBySubject / countInSubject -- active only, and losing
+ *                  copies of resolved duplicate groups excluded
+ *   everywhere else listNotDeleted / countMatching -- everything that is not
+ *                  deleted, duplicates included
+ *
+ * Applying the subject rule to both is what this function used to do, and it
+ * under-selected silently on the second: a `missing`, `moved`, `changed` or
+ * `archived` file, or a duplicate copy, was listed, was counted, and was then
+ * left out of the selection with no message -- `capped` is false, so nothing
+ * fired. The visible symptom was the unfiled pile refusing to empty. You file
+ * "all 40", the tile still says 3, and the loop the Library is built around
+ * (open the pile, select it, file it, watch the number drop) quietly stops
+ * being true, with nothing on screen explaining why.
+ *
+ * Local databases are usually all-active, so this cannot be reproduced away
+ * from a real corpus -- which is exactly why it is written down here rather
+ * than left to be rediscovered.
+ */
+async function idsMatching({ filters = null, subjectId = null, limit = 5000 } = {}) {
+  const startIndex = subjectId ? 2 : 1;
+  const { sql, params } = buildFilterSql(filters, startIndex);
+
+  // Subject scope: mirror listBySubject exactly -- latest-row subject match,
+  // active only, resolved-duplicate losers excluded.
+  const scope = subjectId
+    ? `JOIN LATERAL (
+         SELECT classified_subject_id FROM classification_results cr
+         WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
+       ) latest ON true`
+    : "";
+  const eligibility = subjectId
+    ? `latest.classified_subject_id = $1 AND f.status = 'active'
+        AND ${NOT_A_DUPLICATE_COPY}`
+    // Everything else (the table's "Everything" scope, the unfiled pile):
+    // mirror listNotDeleted, which is the query that put these rows on screen.
+    : LISTABLE_FILE;
+
+  const { rows } = await db.query(
+    `SELECT f.id
+       FROM files f
+       ${scope}
+      WHERE ${eligibility}
+      ${sql}
+      LIMIT $${params.length + startIndex}`,
+    subjectId ? [subjectId, ...params, limit] : [...params, limit]
+  );
+  return rows.map((r) => r.id);
 }
 
 /**
@@ -861,7 +957,7 @@ async function countMatching({ filters = null, includeDeleted = false } = {}) {
   const { rows } = await db.query(
     `SELECT count(*)::int AS count
        FROM files f
-      WHERE ${includeDeleted ? "TRUE" : "f.status != 'deleted'"}
+      WHERE ${includeDeleted ? "TRUE" : LISTABLE_FILE}
       ${sql}`,
     params
   );
@@ -939,9 +1035,11 @@ async function countByStatus(status, ownerUserId) {
  * Subjects browser backed by them would show nothing forever regardless of
  * how many files actually got classified and moved into that subject.
  */
-async function listBySubject(subjectId, { limit = 50, offset = 0, filters = null } = {}) {
+async function listBySubject(subjectId, { limit = 50, offset = 0, filters = null, sort = null } = {}) {
   // $1 is the subject; filters occupy $2.. and limit/offset come last.
   const { sql, params } = buildFilterSql(filters, 2);
+  // Built from a whitelist, never from request text -- see fileFilters.parseSort.
+  const orderBy = buildOrderBy(sort);
   const { rows } = await db.query(
     `SELECT f.id, f.filename_current, f.filename_current AS display_name, f.current_path,
             f.ai_short_title, f.imported_at, f.size_bytes,
@@ -963,15 +1061,9 @@ async function listBySubject(subjectId, { limit = 50, offset = 0, filters = null
        -- the LOSING side of an ALREADY-RESOLVED group (canonical_file_id
        -- is set and isn't this file) -- files in a still-open group, or
        -- not in any group at all, are unaffected.
-       AND NOT EXISTS (
-         SELECT 1 FROM duplicate_group_members dgm
-         JOIN duplicate_groups dg ON dg.id = dgm.duplicate_group_id
-         WHERE dgm.file_id = f.id
-           AND dg.canonical_file_id IS NOT NULL
-           AND dg.canonical_file_id != f.id
-       )
+       AND ${NOT_A_DUPLICATE_COPY}
      ${sql}
-     ORDER BY f.imported_at DESC LIMIT $${params.length + 2} OFFSET $${params.length + 3}`,
+     ORDER BY ${orderBy} LIMIT $${params.length + 2} OFFSET $${params.length + 3}`,
     [subjectId, ...params, limit, offset]
   );
   return rows;
@@ -992,13 +1084,7 @@ async function countBySubject(subjectId, ownerUserId) {
        WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
      ) latest ON true
      WHERE latest.classified_subject_id = $1 AND f.status = 'active'
-       AND NOT EXISTS (
-         SELECT 1 FROM duplicate_group_members dgm
-         JOIN duplicate_groups dg ON dg.id = dgm.duplicate_group_id
-         WHERE dgm.file_id = f.id
-           AND dg.canonical_file_id IS NOT NULL
-           AND dg.canonical_file_id != f.id
-       )
+       AND ${NOT_A_DUPLICATE_COPY}
        AND f.owner_user_id = $2`,
     [subjectId, ownerUserId]
   );
@@ -1027,18 +1113,67 @@ async function countsBySubject({ filters = null } = {}) {
        WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
      ) latest ON true
      WHERE latest.classified_subject_id IS NOT NULL AND f.status = 'active'
-       AND NOT EXISTS (
-         SELECT 1 FROM duplicate_group_members dgm
-         JOIN duplicate_groups dg ON dg.id = dgm.duplicate_group_id
-         WHERE dgm.file_id = f.id
-           AND dg.canonical_file_id IS NOT NULL
-           AND dg.canonical_file_id != f.id
-       )
+       AND ${NOT_A_DUPLICATE_COPY}
      ${sql}
      GROUP BY latest.classified_subject_id`,
     params
   );
   return Object.fromEntries(rows.map((r) => [r.subject_id, r.count]));
+}
+
+/**
+ * The same count, for the other classification axis.
+ *
+ * Kept deliberately parallel to countsBySubject -- same latest-row rule, same
+ * active-only rule, same duplicate exclusion -- because the two numbers appear
+ * in two browse surfaces that a user will compare. If "Invoice: 12" and
+ * "Finance: 12" counted different things, one of them would be a lie and
+ * neither page would say which.
+ *
+ * No rollup here: document types are flat by design (docs/03-taxonomy.md
+ * §3.4). "Invoice" means Invoice.
+ */
+async function countsByDocumentType({ filters = null } = {}) {
+  const { sql, params } = buildFilterSql(filters, 1);
+  const { rows } = await db.query(
+    `SELECT latest.classified_document_type_id AS document_type_id, COUNT(*)::int AS count
+     FROM files f
+     JOIN LATERAL (
+       SELECT classified_document_type_id FROM classification_results cr
+       WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
+     ) latest ON true
+     WHERE latest.classified_document_type_id IS NOT NULL AND f.status = 'active'
+       AND ${NOT_A_DUPLICATE_COPY}
+     ${sql}
+     GROUP BY latest.classified_document_type_id`,
+    params
+  );
+  return Object.fromEntries(rows.map((r) => [r.document_type_id, r.count]));
+}
+
+/**
+ * How many of the owner's files carry no document type at all.
+ *
+ * This number is the point of the page, not a footnote. The axis is populated
+ * by the AI tier, by a filename/extension signal, or by hand -- so on a real
+ * corpus most files legitimately have no type yet, and a browse page that
+ * silently omitted them would suggest the corpus is smaller than it is.
+ */
+async function countUntyped({ filters = null } = {}) {
+  const { sql, params } = buildFilterSql(filters, 1);
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS count
+     FROM files f
+     LEFT JOIN LATERAL (
+       SELECT classified_document_type_id FROM classification_results cr
+       WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
+     ) latest ON true
+     WHERE latest.classified_document_type_id IS NULL AND f.status = 'active'
+       AND ${NOT_A_DUPLICATE_COPY}
+     ${sql}`,
+    params
+  );
+  return rows[0]?.count || 0;
 }
 
 /**
@@ -1051,6 +1186,109 @@ async function countsBySubject({ filters = null } = {}) {
  * does exactly that and reports the difference rather than pretending the
  * whole batch succeeded.
  */
+/**
+ * Which of these ids survive the filter set -- as a Set, for candidates that
+ * arrived from somewhere other than SQL.
+ *
+ * WHY A SEPARATE PASS RATHER THAN A PREDICATE IN THE ORIGINAL QUERY
+ *
+ * The hybrid search (services/descriptionSearchService) fuses three ranked
+ * signals, and only one of them is a database query that can carry the filter
+ * clauses. The semantic signal scores in-memory vectors and the description
+ * signal ranks a different table; both produce bare file ids that never passed
+ * through buildFilterSql. Fusing them with the filtered signal put files back
+ * into the result that every filter on screen excluded -- searching inside one
+ * subject returned documents from other subjects and other storage locations,
+ * which is precisely the "a filter must NARROW a search, not be replaced by
+ * it" contract that scripts/verify-search-filters.js exists to hold.
+ *
+ * Gating the fused set here keeps the ranking intact (this decides membership,
+ * never order) and keeps one definition of what a filter means, which is the
+ * whole argument in the header of fileFilters.js.
+ *
+ * `status <> 'deleted'` rides along because it is the same bar searchEverything
+ * applies. The two id-only signals read tables that have no opinion about file
+ * status, so without it a deleted file stayed findable by its description.
+ */
+async function idsPassingFilters(ids, { filters = null } = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return new Set();
+  // $1 is the id array; the filter clauses (owner first, always) start at $2.
+  const { sql, params } = buildFilterSql(filters, 2);
+  const { rows } = await db.query(
+    `SELECT f.id
+       FROM files f
+      WHERE f.id = ANY($1::uuid[])
+        AND f.status <> 'deleted'
+      ${sql}`,
+    [ids, ...params]
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * Which of these files are ALREADY filed under this subject.
+ *
+ * Filing a file where it already is still writes a classification row, and
+ * "latest row wins" means that row is then the file's history. Re-filing
+ * 50,000 files that never moved would bury every real placement decision under
+ * a wall of no-ops, and cost 50,000 writes to change nothing.
+ *
+ * Used by the bulk move to subtract the no-ops before it starts, and to report
+ * them honestly ("12,000 matched, 11,000 were already there") rather than
+ * claiming credit for moving files that never went anywhere.
+ */
+async function idsCurrentlyInSubject(ids, subjectId) {
+  if (!Array.isArray(ids) || ids.length === 0 || !subjectId) return new Set();
+  const { rows } = await db.query(
+    `SELECT f.id
+       FROM files f
+       JOIN LATERAL (
+         SELECT classified_subject_id FROM classification_results cr
+         WHERE cr.file_id = f.id ORDER BY cr.created_at DESC LIMIT 1
+       ) latest ON true
+      WHERE f.id = ANY($1::uuid[])
+        AND latest.classified_subject_id = $2`,
+    [ids, subjectId]
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * What is sitting in Archive or Trash.
+ *
+ * A separate function rather than a `status` filter on the normal listing,
+ * because these views answer a different question and need a different column:
+ * Trash has to show how long each file has left, which nothing else cares
+ * about. `daysLeft` is computed in SQL so the arithmetic happens once, in the
+ * same timezone as the timestamp it is derived from.
+ */
+async function listByLifecycle(status, ownerUserId, { limit = 100, offset = 0, retentionDays = 30 } = {}) {
+  requireOwner(ownerUserId, "listByLifecycle");
+  const { rows } = await db.query(
+    `SELECT f.*, ${FILE_DECORATION_COLUMNS},
+            f.deleted_at, f.archived_at,
+            CASE WHEN f.status = 'deleted' AND f.deleted_at IS NOT NULL
+                 THEN GREATEST(0, $4::int - EXTRACT(DAY FROM now() - f.deleted_at)::int)
+                 ELSE NULL END AS days_left
+       FROM files f
+       ${FILE_DECORATION}
+      WHERE f.owner_user_id = $1 AND f.status = $2
+      ORDER BY COALESCE(f.deleted_at, f.archived_at) DESC NULLS LAST, f.id DESC
+      LIMIT $3 OFFSET $5`,
+    [ownerUserId, status, limit, retentionDays, offset]
+  );
+  return rows;
+}
+
+async function countByLifecycle(status, ownerUserId) {
+  requireOwner(ownerUserId, "countByLifecycle");
+  const { rows } = await db.query(
+    "SELECT count(*)::int AS count FROM files WHERE owner_user_id = $1 AND status = $2",
+    [ownerUserId, status]
+  );
+  return rows[0].count;
+}
+
 async function listByIdsForOwner(ids, ownerUserId) {
   requireOwner(ownerUserId, "listByIdsForOwner");
   if (!Array.isArray(ids) || ids.length === 0) return [];
@@ -1074,6 +1312,14 @@ module.exports = {
   listPhotos,
   countPhotos,
   countsBySubject,
+  countsByDocumentType,
+  idsMatching,
+  idsPassingFilters,
+  idsCurrentlyInSubject,
+  listByLifecycle,
+  countByLifecycle,
+  countInSubject,
+  countUntyped,
   findByLocationAndPath,
   findBySha256,
   create,

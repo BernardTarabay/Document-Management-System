@@ -173,7 +173,7 @@ export function DashboardPage() {
                   detail="Scans and photos with no readable text"
                 />
                 <AttentionRow
-                  icon={FolderSearch} tone="warning" to="/subjects"
+                  icon={FolderSearch} tone="warning" to="/?unfiled=1"
                   count={attention.unfiled} label="not filed"
                   detail="No subject assigned yet"
                 />

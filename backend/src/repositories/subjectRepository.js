@@ -46,6 +46,73 @@ async function findByPath(materializedPath, ownerUserId) {
 }
 
 /** All descendants of a subject, via the materialized path prefix. */
+/**
+ * Move a folder under a new parent, and drag its whole branch along with it.
+ *
+ * WHY THIS IS NOT `update({ parentId })`
+ *
+ * `update` excludes parent_id on purpose, and its comment says why: the
+ * migration-029 trigger recomputes materialized_path, depth and level for the
+ * ROW BEING WRITTEN only. Move a folder with children that way and the folder
+ * lands correctly while every descendant keeps a path spelling out an ancestry
+ * it no longer has -- and materialized_path is what the descendant-inclusive
+ * subject filter, the count rollup and the tree itself are all built on. The
+ * damage would be silent and everywhere.
+ *
+ * So the branch is rewritten in the same transaction: the trigger fixes the
+ * moved row, and the second statement re-prefixes its descendants. Their slugs
+ * do not change, only the ancestry in front of them, so a string replacement of
+ * the old prefix is exactly right.
+ *
+ * The path is a dot-joined chain of slugs (letters, digits and hyphens -- see
+ * subjectService.slugify), so it carries no LIKE metacharacters and the prefix
+ * match needs no escaping.
+ *
+ * Cycle and depth checks live in the service, where they can produce messages
+ * about folders rather than about constraints.
+ */
+async function reparent(id, newParentId, ownerUserId) {
+  requireOwner(ownerUserId, "subjects.reparent");
+
+  return db.withTransaction(async (client) => {
+    const { rows: [node] } = await client.query(
+      "SELECT * FROM subjects WHERE id = $1 AND owner_user_id = $2 FOR UPDATE",
+      [id, ownerUserId]
+    );
+    if (!node) return null;
+
+    const oldPath = node.materialized_path;
+    const oldDepth = node.depth;
+
+    // The trigger recomputes this row's path, depth and level from the parent.
+    const { rows: [moved] } = await client.query(
+      "UPDATE subjects SET parent_id = $2 WHERE id = $1 AND owner_user_id = $3 RETURNING *",
+      [id, newParentId, ownerUserId]
+    );
+    if (!moved) return null;
+
+    const depthDelta = moved.depth - oldDepth;
+
+    // Descendants: swap the old ancestry prefix for the new one and shift
+    // depth by the same amount the moved folder shifted. `level` is a
+    // projection of depth (migration 029) and is maintained here too, since
+    // this UPDATE touches neither parent_id nor slug and so does not fire the
+    // trigger that would otherwise keep it in step.
+    const { rowCount: movedDescendants } = await client.query(
+      `UPDATE subjects
+          SET materialized_path = $3 || substring(materialized_path from length($2) + 1),
+              depth = depth + $4,
+              level = CASE depth + $4 WHEN 0 THEN 'subject' WHEN 1 THEN 'category'
+                                      ELSE 'subcategory' END::subject_level
+        WHERE owner_user_id = $1
+          AND materialized_path LIKE $2 || '.%'`,
+      [ownerUserId, oldPath, moved.materialized_path, depthDelta]
+    );
+
+    return { subject: moved, movedDescendants };
+  });
+}
+
 async function listSubtree(subjectId, ownerUserId) {
   const subject = await owned.findByIdForOwner(subjectId, ownerUserId);
   if (!subject) return [];
@@ -156,48 +223,8 @@ async function getAncestorChain(subjectId) {
   return rows;
 }
 
-/**
- * Give a brand-new account a starting tree.
- *
- * Six Subjects with a handful of Categories, exactly as before -- but they
- * are now this user's rows, deletable and renameable like anything else they
- * create, rather than a fixed global taxonomy every document had to be forced
- * into. `origin = 'seed'` records where they came from, so the UI can offer
- * "remove the starter folders you never used" without guessing.
- *
- * Kept deliberately small. The point of the dynamic tree is that it grows to
- * fit the documents, and a large speculative structure works against that by
- * making every new folder look like clutter next to twenty empty ones.
- */
-const STARTER_TREE = [
-  ["Personal", ["Identity", "Medical", "Receipts"]],
-  ["Finance", ["Invoices", "Taxes", "Statements"]],
-  ["Administrative", ["Certificates", "Government"]],
-  ["Reference", []],
-];
-
-async function seedStarterTree(ownerUserId, slugify) {
-  requireOwner(ownerUserId, "subjects.seedStarterTree");
-  const created = [];
-  for (const [parentName, children] of STARTER_TREE) {
-    const parent = await create({
-      ownerUserId, parentId: null, name: parentName,
-      slug: slugify(parentName), origin: "seed",
-    });
-    created.push(parent);
-    for (const childName of children) {
-      created.push(await create({
-        ownerUserId, parentId: parent.id, name: childName,
-        slug: slugify(childName), origin: "seed",
-      }));
-    }
-  }
-  return created;
-}
-
 module.exports = {
   ...base, ...owned,
   listForOwnerTree, listChildren, listTopLevel, findByPath, listSubtree,
-  create, update, touchUsed, listRecentlyUsed, getAncestorChain, seedStarterTree,
-  STARTER_TREE,
+  create, update, reparent, touchUsed, listRecentlyUsed, getAncestorChain,
 };

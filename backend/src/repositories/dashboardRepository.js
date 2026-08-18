@@ -30,7 +30,23 @@ const OWNED_FILE = (fileIdExpr) =>
 // A file counts as "in the repository" unless it has been deleted. Missing
 // files (the drive is unplugged) still count -- they are known documents, and
 // hiding them would make the total silently shrink when a disk goes offline.
-const LIVE = "f.status <> 'deleted'";
+/**
+ * What the dashboard counts as a document.
+ *
+ * Not deleted, not archived, and not the losing copy of a duplicate the user
+ * has already settled -- the same definition the Library lists by
+ * (fileFilters.LISTABLE_FILE). It has to be the same or the two disagree, and
+ * they did: the overview reported 31 documents while the library held 16
+ * distinct ones, because registering a second overlapping folder doubled the
+ * count of everything.
+ *
+ * This applies to the whole overview deliberately, funnel included. "16
+ * documents, 16 hashed, 16 described" describes an archive; the same numbers
+ * doubled by however many backup folders happen to be registered describe
+ * nothing anyone asked about.
+ */
+const { LISTABLE_FILE } = require("./fileFilters");
+const LIVE = LISTABLE_FILE;
 
 /**
  * Headline totals plus the processing funnel, in one pass over `files`.

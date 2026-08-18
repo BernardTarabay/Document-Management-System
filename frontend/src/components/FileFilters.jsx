@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { SlidersHorizontal, X, CalendarRange, HardDrive, FolderTree, FileType2 } from "lucide-react";
+import { SlidersHorizontal, X, CalendarRange, HardDrive, FolderTree, FileType2, Stamp } from "lucide-react";
 import { api } from "../services/apiClient";
 import { useApiData } from "../hooks/useApiData";
 
@@ -27,6 +27,7 @@ export const EMPTY_FILTERS = Object.freeze({
   dateFrom: "",
   dateTo: "",
   subjectId: "",
+  documentTypeId: "",
   storageLocationId: "",
   pathPrefix: "",
 });
@@ -39,6 +40,7 @@ export function filtersToParams(filters) {
     dateFrom: filters.dateFrom || undefined,
     dateTo: filters.dateTo || undefined,
     subjectId: filters.subjectId || undefined,
+    documentTypeId: filters.documentTypeId || undefined,
     storageLocationId: filters.storageLocationId || undefined,
     pathPrefix: filters.pathPrefix || undefined,
   };
@@ -50,6 +52,7 @@ export function countActiveFilters(filters) {
     (filters.ext?.length ? 1 : 0) +
     (filters.dateFrom || filters.dateTo ? 1 : 0) +
     (filters.subjectId ? 1 : 0) +
+    (filters.documentTypeId ? 1 : 0) +
     (filters.storageLocationId ? 1 : 0) +
     (filters.pathPrefix ? 1 : 0)
   );
@@ -63,6 +66,11 @@ export function FileFilters({
   onChange,
   showSubject = true,
   subjects = null,
+  // Off on the Document Types page for the same reason showSubject is off on
+  // the Subjects page: that page's list IS the picker, and a dropdown beside
+  // it would be a second, quieter way to disagree with what is selected.
+  showDocumentType = true,
+  documentTypes = null,
   resultCount = null,
   totalCount = null,
 }) {
@@ -93,6 +101,11 @@ export function FileFilters({
     const s = subjects.find((x) => x.id === value.subjectId);
     return s ? s.materialized_path || s.name : null;
   }, [value.subjectId, subjects]);
+
+  const documentTypeName = useMemo(() => {
+    if (!value.documentTypeId || !documentTypes) return null;
+    return documentTypes.find((d) => d.id === value.documentTypeId)?.name || null;
+  }, [value.documentTypeId, documentTypes]);
 
   // Keyed on `options` rather than the derived `locations` array, which is a
   // fresh [] on every render while the fetch is in flight and would defeat
@@ -132,6 +145,9 @@ export function FileFilters({
         )}
         {subjectName && (
           <Chip icon={FolderTree} onClear={() => set({ subjectId: "" })}>{subjectName}</Chip>
+        )}
+        {documentTypeName && (
+          <Chip icon={Stamp} onClear={() => set({ documentTypeId: "" })}>{documentTypeName}</Chip>
         )}
         {locationName && (
           <Chip icon={HardDrive} onClear={() => set({ storageLocationId: "" })}>{locationName}</Chip>
@@ -239,6 +255,27 @@ export function FileFilters({
                   ))}
                 </select>
                 <p className="mt-1 text-[11px] text-base-500">Includes everything filed underneath it.</p>
+              </div>
+            )}
+
+            {showDocumentType && (
+              <div>
+                <label className="label mb-1.5 block">Document type</label>
+                <select
+                  className="input"
+                  value={value.documentTypeId}
+                  onChange={(e) => set({ documentTypeId: e.target.value })}
+                >
+                  <option value="">— Any —</option>
+                  {(documentTypes || []).map((d) => (
+                    <option key={d.id} value={d.id}>{d.name}</option>
+                  ))}
+                </select>
+                {/* Said here rather than discovered later: most files have no
+                    type yet, so this filter narrows hard. It is not broken. */}
+                <p className="mt-1 text-[11px] text-base-500">
+                  What kind of document it is, independent of where it is filed.
+                </p>
               </div>
             )}
 

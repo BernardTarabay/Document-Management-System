@@ -23,6 +23,67 @@ async function create({ fileId, classifiedSubjectId = null, classifiedDocumentTy
   return rows[0];
 }
 
+/**
+ * The file's current classification row, whatever it says.
+ *
+ * Deliberately NOT filtered to non-null values, unlike findLatestSubjectForFile
+ * below: this is the "what does the file look like right now" read that
+ * createPartial builds on, and for that a null has to mean null.
+ */
+async function findLatestForFile(fileId, client = null) {
+  const exec = client || db;
+  const { rows } = await exec.query(
+    `SELECT classified_subject_id, classified_document_type_id
+       FROM classification_results
+      WHERE file_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [fileId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Write a classification row that changes only the axes it names, carrying the
+ * others forward unchanged.
+ *
+ * WHY THIS EXISTS. Subject and document type are orthogonal axes
+ * (docs/03-taxonomy.md §3.4) that share one row, and every consumer resolves a
+ * file's classification as "the latest row" (repositories/fileFilters.js). Any
+ * writer that knew about one axis and passed null for the other was therefore
+ * not adding information, it was DELETING the other axis.
+ *
+ * That is what emptied the document-type dimension. fileOrganizeService.
+ * moveToSubject hardcoded `classifiedDocumentTypeId: null`, so filing a
+ * document under a subject -- the single most common curation action, and the
+ * one the whole Subjects page exists to perform -- erased whatever type the
+ * file had. The same hole ran the other way: setting a document type from the
+ * Files page wrote `classifiedSubjectId: null` and dropped the file out of its
+ * subject.
+ *
+ * `undefined` means "I am not speaking to this axis, keep what is there".
+ * `null` means "clear this axis", which stays expressible. The result is that
+ * every row is a complete snapshot of the file's classification, which is what
+ * "latest row wins" was already assuming everywhere downstream.
+ *
+ * The same reasoning as the move path itself: enforce the invariant here, once,
+ * rather than asking every future caller to remember it.
+ */
+async function createPartial({ fileId, classifiedSubjectId, classifiedDocumentTypeId, ...rest }, client = null) {
+  const current = await findLatestForFile(fileId, client);
+  return create(
+    {
+      fileId,
+      classifiedSubjectId:
+        classifiedSubjectId === undefined ? current?.classified_subject_id ?? null : classifiedSubjectId,
+      classifiedDocumentTypeId:
+        classifiedDocumentTypeId === undefined ? current?.classified_document_type_id ?? null : classifiedDocumentTypeId,
+      ...rest,
+    },
+    client
+  );
+}
+
 async function listProposedForFile(fileId) {
   const { rows } = await db.query(
     "SELECT * FROM classification_results WHERE file_id = $1 ORDER BY created_at DESC",
@@ -63,4 +124,12 @@ async function review(id, { status, reviewedBy }) {
   return rows[0] || null;
 }
 
-module.exports = { ...base, create, listProposedForFile, findLatestSubjectForFile, review };
+module.exports = {
+  ...base,
+  create,
+  createPartial,
+  listProposedForFile,
+  findLatestForFile,
+  findLatestSubjectForFile,
+  review,
+};

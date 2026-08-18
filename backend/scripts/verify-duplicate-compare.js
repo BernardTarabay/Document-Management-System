@@ -89,6 +89,10 @@ const BODY =
   for (const n of NAMES) await fsp.writeFile(path.join(root, n), "content of " + n);
 
   const admin = (await p.query("SELECT id FROM users ORDER BY created_at LIMIT 1")).rows[0];
+  // Every read below is owner-scoped (repositories/ownership.js): the owner is
+  // a required argument, not an optional narrowing, so a fixture that omits it
+  // throws rather than quietly reading the whole instance.
+  const ownerId = admin.id;
   const loc = await storageLocationService.create(
     { name: "Dup Compare Test", type: "local", rootPath: root, accessMode: "direct" }, admin.id);
   locId = loc.id;
@@ -132,7 +136,7 @@ const BODY =
 
   // One copy is filed and the other is not -- exactly the kind of difference
   // that decides which copy to keep, and exactly what was not being shown.
-  const subject = (await subjectRepository.list({ limit: 1 }))[0];
+  const subject = (await subjectRepository.listTopLevel(ownerId))[0];
   await classificationResultRepository.create({
     fileId: idOf("copy-one.txt"),
     classifiedSubjectId: subject.id,
@@ -144,7 +148,7 @@ const BODY =
   });
 
   const group = await duplicateGroupRepository.createGroup({
-    groupType: "exact", detectionMethod: "hash", confidenceLevel: "high", confidenceScore: 1,
+    ownerUserId: ownerId, groupType: "exact", detectionMethod: "hash", confidenceLevel: "high", confidenceScore: 1,
   });
   groupId = group.id;
   await duplicateGroupRepository.addMember(groupId, idOf("copy-one.txt"), 1);
@@ -154,7 +158,7 @@ const BODY =
 
   console.log("\ninspecting a group's members:\n");
 
-  const detail = await duplicateGroupService.getById(groupId);
+  const detail = await duplicateGroupService.getById(groupId, ownerId);
   const byName = Object.fromEntries(detail.members.map((m) => [m.filename_current, m]));
   const one = byName["copy-one.txt"];
   const two = byName["copy-two.txt"];
@@ -189,7 +193,7 @@ const BODY =
     JSON.stringify(detail.members.map((m) => m.is_canonical)));
 
   await duplicateGroupService.resolve(groupId, { canonicalFileId: idOf("copy-one.txt") }, admin.id);
-  const afterResolve = await duplicateGroupService.getById(groupId);
+  const afterResolve = await duplicateGroupService.getById(groupId, ownerId);
   const flags = Object.fromEntries(afterResolve.members.map((m) => [m.filename_current, m.is_canonical]));
   check("after resolving, exactly the chosen copy is flagged canonical",
     flags["copy-one.txt"] === true && flags["copy-two.txt"] === false, JSON.stringify(flags));
@@ -198,22 +202,22 @@ const BODY =
 
   console.log("\ncomparing pairs:\n");
 
-  const identical = await fileService.compareFiles(idOf("copy-one.txt"), idOf("copy-two.txt"));
+  const identical = await fileService.compareFiles(idOf("copy-one.txt"), idOf("copy-two.txt"), ownerId);
   check("two byte-identical copies compare as exact",
     identical.verdict === "exact" && identical.identical === true && identical.similarity === 1,
     `${identical.verdict} @ ${identical.similarity}`);
 
-  const near = await fileService.compareFiles(idOf("copy-one.txt"), idOf("near-copy.txt"));
+  const near = await fileService.compareFiles(idOf("copy-one.txt"), idOf("near-copy.txt"), ownerId);
   check("a near-copy compares as a probable duplicate, above the threshold",
     near.verdict === "probable" && near.similarity >= near.threshold,
     `${near.verdict} @ ${(near.similarity * 100).toFixed(1)}% (threshold ${(near.threshold * 100).toFixed(0)}%)`);
 
-  const distinct = await fileService.compareFiles(idOf("copy-one.txt"), idOf("unrelated.txt"));
+  const distinct = await fileService.compareFiles(idOf("copy-one.txt"), idOf("unrelated.txt"), ownerId);
   check("two unrelated documents compare as distinct",
     distinct.verdict === "distinct" && distinct.similarity < distinct.threshold,
     `${distinct.verdict} @ ${(distinct.similarity * 100).toFixed(1)}%`);
 
-  const tooShort = await fileService.compareFiles(idOf("copy-one.txt"), idOf("almost-empty.txt"));
+  const tooShort = await fileService.compareFiles(idOf("copy-one.txt"), idOf("almost-empty.txt"), ownerId);
   check("a file with too little text refuses to be scored rather than guessing",
     tooShort.verdict === "not_comparable" && tooShort.similarity === null,
     `${tooShort.verdict}, names the file: ${/almost-empty/.test(tooShort.explanation)}`);
@@ -226,7 +230,7 @@ const BODY =
   check("comparing created no new duplicate-group membership", groupCount === 2, `${groupCount} memberships`);
 
   let sameFile = null;
-  try { await fileService.compareFiles(idOf("copy-one.txt"), idOf("copy-one.txt")); }
+  try { await fileService.compareFiles(idOf("copy-one.txt"), idOf("copy-one.txt"), ownerId); }
   catch (err) { sameFile = err.message; }
   check("comparing a file with itself is refused", /two different files/i.test(sameFile || ""),
     sameFile || "(it was allowed!)");

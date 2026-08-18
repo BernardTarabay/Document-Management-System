@@ -27,6 +27,7 @@ depend on whatever is in your `.env`.
 | `emailTriage.test.js` | `ruleClassify` | This tier auto-trashes mail with **no human review**. The most important assertions are the *negative* ones: a `no-reply@` sender without `List-Unsubscribe` (receipts, password resets, 2FA) must fall through to the AI tier rather than be junked on the sender pattern alone. |
 | `namingService.test.js` | canonical name + folder building | Decides what files are physically renamed to. This repository's real content is French/Arabic/Hebrew, and an earlier `[a-zA-Z0-9]` filter deleted non-Latin names outright — those regressions are pinned here. |
 | `utils.test.js` | pagination, signature detection, filename collisions | `fs.rename()` silently overwrites, so `resolveAvailableFilename` is the only thing between a bulk rename and data loss. Signature tests pin spec §7 (content beats extension) and §8 (a PBIX is not a spreadsheet). |
+| `taxonomyMatcher.test.js` | keyword terms + matching for the rule tier | This was wrong in production and nothing caught it: of 13 seeded document types exactly one was ever assigned, to a personal narrative, on the substrings inside "playbook" and "fantasy books". The keyword list was `[name, code]` — the same word twice for every single-word type — so one occurrence scored 2, silently satisfying a MEDIUM threshold whose own comment demanded "two independent body matches". Pins the substring bleed, the double-count, and that French/Arabic words are not split by the ASCII `\b` rule. |
 
 ## What is deliberately *not* covered here
 

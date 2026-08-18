@@ -142,6 +142,39 @@ async function searchLexical(query, ownerUserId, { limit = 50 } = {}) {
 }
 
 /**
+ * Descriptions for a batch of files, as a Map of file id -> description text.
+ *
+ * The listing queries decorate a file with its subject, location and naming
+ * state (fileRepository.FILE_DECORATION_COLUMNS) but deliberately not with its
+ * description -- it is long, and no table view has room for it. Anything that
+ * needs the description for a set of files it already has therefore has to ask
+ * for it, and asking once for the whole set beats a query per file.
+ *
+ * The assistant is the caller this exists for: it was describing files to the
+ * user with nothing but a filename to go on (see aiChatController), which is
+ * why it could not find a photo by what is in it.
+ *
+ * Rows with no description text are omitted rather than returned as null --
+ * "this file has no description" and "this file was not asked about" are the
+ * same thing to every caller, and a Map that only holds real values makes the
+ * absent case impossible to render as the string "null".
+ */
+async function descriptionsForFiles(fileIds, ownerUserId) {
+  requireOwner(ownerUserId, "fileDescriptions.descriptionsForFiles");
+  if (!Array.isArray(fileIds) || fileIds.length === 0) return new Map();
+  const { rows } = await db.query(
+    `SELECT file_id, description
+       FROM file_descriptions
+      WHERE file_id = ANY($1::uuid[])
+        AND owner_user_id = $2
+        AND description IS NOT NULL
+        AND description <> ''`,
+    [fileIds, ownerUserId]
+  );
+  return new Map(rows.map((r) => [r.file_id, r.description]));
+}
+
+/**
  * Files that have no description row at all, or whose description failed and
  * is worth another attempt. The backfill script's work list.
  *
@@ -214,5 +247,6 @@ async function findDescribedTwin(sha256Hash, excludeFileId, ownerUserId) {
 module.exports = {
   upsert, setEmbedding, findByFile, findByFileForOwner,
   listEmbeddingsForOwner, embeddingWatermark, searchLexical,
+  descriptionsForFiles,
   listNeedingDescription, countBySource, findDescribedTwin,
 };
