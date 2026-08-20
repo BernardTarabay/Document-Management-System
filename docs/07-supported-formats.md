@@ -14,7 +14,20 @@ requirement not to rely on extensions alone.
 | `.pptx` | zip + `ppt/presentation.xml` entry | **Full** — per-slide text + slide count (`pptxExtractor.js`) | Same lightweight approach as docx. |
 | `.pbix` | zip + `DataModel`/`Report/Layout` entries | **Investigation-only** — container metadata + Report/Layout visible strings; the actual data model (measures/tables/relationships) is a proprietary xVelocity/SSAS binary blob and is deliberately **not** parsed (`pbixExtractor.js`) | This is the case spec §8 specifically warns about: a pbix is a zip, like xlsx, but is not structurally a spreadsheet — treating it as one would silently produce garbage. Full data-model introspection would require the Analysis Services engine and is out of scope. |
 | `.doc` / `.xls` / `.ppt` (legacy OLE-CFB) | `D0 CF 11 E0 A1 B1 1A E1` magic bytes | **Full** — text + `SummaryInformation` metadata (`oleCfbExtractor.js`) | All three share one container signature, so dispatch is by *which document stream the container holds* (`WordDocument` / `Workbook` / `PowerPoint Document`), not by extension — a `.doc` renamed `.xls` still extracts correctly. See "Legacy formats" below for what each parser does. |
+| `.txt` `.log` `.md` `.csv` `.tsv` `.json` `.yaml` `.ini` … | **none — by extension only** | **Full** — the bytes are the text (`textExtractor.js`) | Plain text has no magic bytes, so this is the one family detected by extension alone. That makes the extension list an explicit **allowlist**: decoding every signature-less file as text would index unknown binaries as mojibake. Encoding is resolved BOM → verified UTF-8 → CP1252, in that order, because this corpus is French (often CP1252 from older Windows tooling) and Arabic (essentially always UTF-8). A file whose decoded contents contain a NUL or a high proportion of control characters is refused rather than indexed. |
+| `.html` `.htm` `.xml` `.xhtml` | as above | **Full** — tags stripped to prose (`textExtractor.js`) | Indexed as prose via the same `stripXmlToText` docx/pptx use. Indexing the markup itself would match searches for "div" and dilute every real term in the document. |
 | Anything else | no known signature match | **Ingested, flagged unsupported** | `extractContent()` never throws for an unrecognized format — it returns a structured "unsupported" result so the file still gets a File row, a hash, and is browsable; it simply has no extracted text/metadata to search on yet. |
+
+> **Note on the plain-text rows.** They were added after this list was first
+> finalized. The original investigation covered the formats that need parsing
+> and never considered the one that does not, so `.txt` fell through to the
+> "anything else" row above and was ingested as an unsupported binary — hashed
+> and browsable, holding zero characters. Because every later stage reads that
+> text, the consequence was not just an empty excerpt: no classification, no
+> document date from content, no rename proposal, and a facts-only description.
+> A 3 KB CV in the test corpus extracted 0 characters; it now extracts 3,158.
+> `tests/textExtraction.test.js` pins both halves — that text comes out, and
+> that a mislabelled binary still does not.
 
 ## Legacy formats (OLE-CFB)
 
