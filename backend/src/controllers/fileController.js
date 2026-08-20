@@ -1,5 +1,6 @@
 const fileService = require("../services/fileService");
 const lifecycleService = require("../services/lifecycleService");
+const mirrorService = require("../services/mirror/mirrorService");
 const mime = require("../utils/mimeGuess");
 const { buildContentDisposition } = require("../utils/contentDisposition");
 
@@ -223,9 +224,33 @@ async function compare(req, res) {
   res.json(await fileService.compareFiles(fileIdA, fileIdB, req.user.id));
 }
 
+/**
+ * Rebuild the organized shortcut folder on demand.
+ *
+ * 202 rather than 200, like triggerScan: the work is queued, not done. The
+ * caller gets the processing_jobs row and watches it in the Jobs dock, which
+ * already knows how to render this job type (JobsDock.jsx labels it "Updating
+ * organized folder") -- it simply never had a way to start one.
+ */
+async function mirrorSync(req, res) {
+  const job = await mirrorService.queueSync(req.user.id, {
+    // Pruning is the default and the safe one: a shortcut whose file is gone
+    // is a dead link. Opting out is for the rare case of rebuilding while a
+    // drive is unplugged, where every file on it would otherwise look deleted.
+    prune: req.body?.prune !== false,
+  });
+  res.status(202).json(job);
+}
+
+/** Where the mirror is configured to live, and how much of it is built. */
+async function mirrorStatus(req, res) {
+  res.json(await mirrorService.status(req.user.id));
+}
+
 module.exports = {
   list, count, filterOptions, matchingIds, getOne, download, preview, remove, removeAll, compare, update, reveal,
   moveMany,
   moveByFilter,
   lifecycleList, lifecycleSummary, lifecycleMove, lifecycleRestore, lifecyclePurge,
+  mirrorSync, mirrorStatus,
 };

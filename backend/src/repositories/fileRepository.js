@@ -191,6 +191,38 @@ async function listForMirror(ownerUserId, { limit = 1000, offset = 0 } = {}) {
   return rows;
 }
 
+/**
+ * How much of this account's mirror exists.
+ *
+ * `eligible` MUST use the same predicate as listForMirror above -- active,
+ * owned, and carrying either a canonical name or a subject. A count that
+ * disagrees with what a sync would actually walk is worse than no count: it
+ * reports work as outstanding that no sync will ever do, or reports the mirror
+ * complete while files are missing from it. The two queries are next to each
+ * other for that reason; change one and change the other.
+ */
+async function mirrorCounts(ownerUserId) {
+  requireOwner(ownerUserId, "mirrorCounts");
+  const { rows } = await db.query(
+    `SELECT count(*)::int                                              AS eligible,
+            count(*) FILTER (WHERE f.mirror_path IS NOT NULL)::int     AS mirrored,
+            max(f.mirror_synced_at)                                    AS "lastSyncedAt"
+       FROM files f
+       LEFT JOIN LATERAL (
+         SELECT s.materialized_path AS subject_path
+           FROM classification_results cr
+           JOIN subjects s ON s.id = cr.classified_subject_id
+          WHERE cr.file_id = f.id AND cr.classified_subject_id IS NOT NULL
+          ORDER BY cr.created_at DESC LIMIT 1
+       ) cls ON true
+      WHERE f.status = 'active'
+        AND f.owner_user_id = $1
+        AND (f.canonical_filename IS NOT NULL OR cls.subject_path IS NOT NULL)`,
+    [ownerUserId]
+  );
+  return rows[0];
+}
+
 async function setMirrorPath(id, mirrorPath) {
   const { rows } = await db.query(
     "UPDATE files SET mirror_path = $2, mirror_synced_at = now() WHERE id = $1 RETURNING id",
@@ -1331,6 +1363,7 @@ module.exports = {
   updateHash,
   setCanonicalName,
   listForMirror,
+  mirrorCounts,
   setMirrorPath,
   setCloudPlaceholder,
   updateMimeDetected,

@@ -56,6 +56,17 @@ router.post("/lifecycle/purge", requirePermission("document.delete"), asyncHandl
 router.get("/lifecycle/:destination", requirePermission("document.view"), asyncHandler(controller.lifecycleList));
 router.post("/lifecycle/:destination", requirePermission("document.delete"), asyncHandler(controller.lifecycleMove));
 
+// The organized shortcut folder. Literal segments before "/:id", same rule as
+// "/lifecycle" and "/compare" above, or "mirror" is read as a file id and
+// fails the uuid cast.
+//
+// scan.run rather than a new permission: rebuilding the mirror is the same
+// kind of act as triggering a scan -- a long job over the whole archive,
+// started by a person -- and a permission key that no seed grants would 403
+// for everybody until a migration caught up.
+router.get("/mirror/status", requirePermission("document.view"), asyncHandler(controller.mirrorStatus));
+router.post("/mirror/sync", requirePermission("scan.run"), asyncHandler(controller.mirrorSync));
+
 router.get("/:id", requirePermission("document.view"), asyncHandler(controller.getOne));
 router.get("/:id/download", requirePermission("document.download"), asyncHandler(controller.download));
 // Preview streams the same bytes as download (mime-whitelisted, inline) --

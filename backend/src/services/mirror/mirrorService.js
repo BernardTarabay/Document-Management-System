@@ -16,6 +16,9 @@ const env = require("../../config/env");
 const { resolveWithinRoot } = require("../../utils/pathSafety");
 const { requireOwner } = require("../../repositories/ownership");
 const { writeShortcuts, shortcutNameFor } = require("./shortcutWriter");
+const { enqueueJob } = require("../../queues");
+const { JobType } = require("../../models/enums");
+const { ValidationError } = require("../../validators/validationError");
 
 // Batch size for shortcut writing. Large enough that PowerShell startup
 // cost is amortized, small enough that one failure doesn't lose much work.
@@ -273,4 +276,72 @@ async function pruneStale(root, expected) {
   return pruned;
 }
 
-module.exports = { sync, mirrorRoot, mirrorRelativePathFor, safeSegment, disambiguate };
+/**
+ * Queue a rebuild of one account's organized shortcut folder.
+ *
+ * WHY THIS IS HERE AT ALL
+ *
+ * syncMirrorProcessor's header says the job is "chained off bulk_rename so
+ * approving a name makes the shortcut appear on its own, and available on
+ * demand from the UI". The first half was true; the second was never built.
+ * There was no endpoint, no controller and no button -- `grep -rn mirror
+ * src/routes src/controllers` returned nothing -- so the only way the mirror
+ * could ever be built was as a side effect of approving a rename, and an
+ * archive whose names were all already correct could not build it at all.
+ *
+ * On this installation that showed up as zero `sync_mirror` rows in
+ * processing_jobs, ever, and zero files carrying a `mirror_path`: a complete,
+ * working feature that nothing could reach.
+ *
+ * Enqueued rather than run inline for the reason the processor gives -- it
+ * walks and writes across the whole archive, which must never happen inside a
+ * request.
+ *
+ * @param {string} actorUserId - whose mirror, and who asked
+ * @param {object} [opts]
+ * @param {boolean} [opts.prune=true] - remove shortcuts with no live file behind them
+ */
+async function queueSync(actorUserId, { prune = true } = {}) {
+  requireOwner(actorUserId, "mirrorService.queueSync");
+
+  // Fail here, with a message naming the variable, rather than letting the job
+  // be created and then die in a worker where nobody looks. mirrorRoot()
+  // throws the same way; this just moves it to the request.
+  if (!env.mirrorRoot) {
+    throw new ValidationError(
+      "MIRROR_ROOT is not set, so there is nowhere to build the organized folder. " +
+      "Set it in backend/.env and restart the server."
+    );
+  }
+
+  return enqueueJob(
+    JobType.SYNC_MIRROR,
+    { prune, actorUserId, ownerUserId: actorUserId },
+    { createdBy: actorUserId, ownerUserId: actorUserId }
+  );
+}
+
+/**
+ * What the mirror is configured to do and how much of it exists.
+ *
+ * Enough for the UI to explain itself before anything is clicked: whether
+ * MIRROR_ROOT is set at all, where it points, and how many of this account's
+ * files currently have a shortcut. `configured: false` is a legitimate state,
+ * not an error -- the mirror is optional.
+ */
+async function status(ownerUserId) {
+  requireOwner(ownerUserId, "mirrorService.status");
+
+  if (!env.mirrorRoot) {
+    return { configured: false, mirrorRoot: null, mirrored: 0, eligible: 0, lastSyncedAt: null };
+  }
+
+  const counts = await fileRepository.mirrorCounts(ownerUserId);
+  return {
+    configured: true,
+    mirrorRoot: mirrorRoot(ownerUserId),
+    ...counts,
+  };
+}
+
+module.exports = { sync, queueSync, status, mirrorRoot, mirrorRelativePathFor, safeSegment, disambiguate };
