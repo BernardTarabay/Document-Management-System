@@ -101,14 +101,40 @@ async function main() {
     check(alice.id && bob.id && alice.id !== bob.id, "two distinct accounts created");
 
     // ---------------------------------------------------------------------
-    console.log("\nStarter data is per-account");
-    const aliceSubjects = await subjectRepository.listForOwnerTree(alice.id);
-    const bobSubjects = await subjectRepository.listForOwnerTree(bob.id);
-    check(aliceSubjects.length > 0, `Alice got a starter tree (${aliceSubjects.length} folders)`);
-    check(bobSubjects.length > 0, `Bob got a starter tree (${bobSubjects.length} folders)`);
+    console.log("\nFolders are per-account");
+    //
+    // THIS SECTION USED TO ASSUME A STARTER TREE AND HAD BEEN BROKEN SINCE
+    // REGISTRATION STOPPED SEEDING ONE.
+    //
+    // authService.register deliberately creates no folders now ("An empty
+    // library is an honest starting point -- nobody has told us anything
+    // yet"). So listForOwnerTree returned [] for both accounts, the two
+    // `length > 0` checks below failed, and -- much worse -- `aliceTarget`
+    // and `bobTarget` further down resolved to `undefined`. The three
+    // cross-account filing checks then "passed their refusal" by throwing
+    // TypeError on `undefined.id`, which looks like a refusal and proves
+    // nothing about authorization at all.
+    //
+    // Each account now builds its own tree, which is what the product
+    // expects a real user to do, and makes the checks below exercise the
+    // ownership guard rather than a crash.
+    // Both accounts deliberately use the SAME names. That is what makes the
+    // per-owner-uniqueness check below meaningful: under the old global unique
+    // index on root slugs, the second "Personal" could not have been created
+    // at all, and this call would throw rather than return a row.
+    const makeTree = async (user) => {
+      const root = await subjectService.create({ name: "Personal" }, user.id);
+      await subjectService.create({ name: "Correspondence", parentId: root.id }, user.id);
+      return subjectRepository.listForOwnerTree(user.id);
+    };
+
+    const aliceSubjects = await makeTree(alice);
+    const bobSubjects = await makeTree(bob);
+    check(aliceSubjects.length === 2, `Alice built her own tree (${aliceSubjects.length} folders)`);
+    check(bobSubjects.length === 2, `Bob built his own tree (${bobSubjects.length} folders)`);
     check(
       aliceSubjects.every((s) => !bobSubjects.some((b) => b.id === s.id)),
-      "the two starter trees share no rows"
+      "the two trees share no rows"
     );
     // The old schema had a GLOBAL unique index on root slugs, so the second
     // account could not have had a "Personal" of its own at all.

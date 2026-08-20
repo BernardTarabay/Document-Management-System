@@ -14,6 +14,7 @@
     "db:reset-data": "node src/db/resetData.js",
     "test": "node --test \"tests/**/*.test.js\"",
     "verify:agent": "node scripts/verify-agent-e2e.js",
+    "verify:all": "node scripts/verify-all.js",
     "test:watch": "node --test --watch \"tests/**/*.test.js\""
   },
   "keywords": [],

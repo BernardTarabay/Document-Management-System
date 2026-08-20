@@ -91,7 +91,7 @@ async function cleanup() {
   console.log("\nfixtures: pending at 0, 0, 0.2, 0.5, 0.95 + one APPLIED at 0");
 
   // --- dry run must agree with what the action then does ------------------
-  const preview = await renameProposalService.countPendingBelowConfidence(0);
+  const preview = await renameProposalService.countPendingBelowConfidence(0, admin.id);
   check("dry run counts exactly the two pending zeros", preview.count === 2, `count=${preview.count}`);
 
   const result = await renameProposalService.rejectBelowConfidence(0, admin.id);
@@ -114,7 +114,7 @@ async function cleanup() {
     JSON.stringify(survivors));
 
   // --- the threshold is inclusive, and must not run away ------------------
-  const preview2 = await renameProposalService.countPendingBelowConfidence(0.5);
+  const preview2 = await renameProposalService.countPendingBelowConfidence(0.5, admin.id);
   check("0.5 threshold is inclusive of 0.5", preview2.count === 2, `count=${preview2.count}`);
 
   const r2 = await renameProposalService.rejectBelowConfidence(0.5, admin.id);

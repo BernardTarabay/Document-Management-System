@@ -4,19 +4,45 @@
 // Registers the test folder read-only, ingests and extracts text (no AI
 // calls -- classification is not needed to prove search works), then runs
 // queries and reports what comes back. Cleans up after itself.
+const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const env = require("../src/config/env");
+
+// Set by the two mechanical checks at the bottom; read by the exit handler.
+let failed = false;
 const { Pool } = require("pg");
 const storageLocationService = require("../src/services/storageLocationService");
 const scanProcessor = require("../src/jobs/processors/scanProcessor");
 const hashProcessor = require("../src/jobs/processors/hashProcessor");
 const extractTextProcessor = require("../src/jobs/processors/extractTextProcessor");
 const fileRepository = require("../src/repositories/fileRepository");
+// Owner-scoped through filters, as fileService.search does in production.
+const { parseFileFilters } = require("../src/repositories/fileFilters");
 const { closeAllQueues } = require("../src/queues");
 const { closeRedisConnection } = require("../src/config/redis");
 
-const SOURCE = process.argv[2] || "C:\\Users\\user\\OneDrive\\Desktop\\test";
+// WHERE THE REAL DOCUMENTS ARE.
+//
+// This was hardcoded to "C:\Users\user\OneDrive\Desktop\test" -- a profile
+// that exists on nobody's machine but the one it was written on. The script
+// therefore died with a bare ENOENT naming a path the reader has never heard
+// of, which reads like a missing folder rather than a wrong default.
+//
+// Now: an explicit argument wins, then VERIFY_SOURCE_DIR, then the same
+// folder relative to whoever is actually logged in. If none of them exist the
+// script says so and names what it tried, rather than failing on `access`.
+const os = require("os");
+
+const SOURCE_CANDIDATES = [
+  process.argv[2],
+  process.env.VERIFY_SOURCE_DIR,
+  path.join(os.homedir(), "OneDrive", "Desktop", "test"),
+  path.join(os.homedir(), "OneDrive", "Desktop", "test2"),
+  path.join(os.homedir(), "Desktop", "test"),
+].filter(Boolean);
+
+const SOURCE = SOURCE_CANDIDATES.find((candidate) => fs.existsSync(candidate)) || SOURCE_CANDIDATES[0];
 const KEEP = process.argv.includes("--keep");
 
 const p = new Pool({ connectionString: env.databaseUrl });
@@ -47,7 +73,17 @@ async function cleanup() {
 }
 
 (async () => {
-  await fsp.access(SOURCE);
+  if (!fs.existsSync(SOURCE)) {
+    console.error(
+      "\nThis script searches REAL documents and needs a folder of them.\n" +
+      "None of these exist:\n" +
+      SOURCE_CANDIDATES.map((c) => `  - ${c}`).join("\n") +
+      "\n\nPass one:  node scripts/verify-search.js \"D:\\\\path\\\\to\\\\documents\"\n" +
+      "or set VERIFY_SOURCE_DIR.\n"
+    );
+    failed = true;
+    return;
+  }
   console.log("source folder:", SOURCE);
 
   const admin = await p.query("SELECT id FROM users ORDER BY created_at LIMIT 1");
@@ -89,7 +125,7 @@ async function cleanup() {
 
   console.log("\n================ SEARCH RESULTS ================");
   for (const [q, why] of queries) {
-    const rows = await fileRepository.searchEverything(q, { limit: 4 });
+    const rows = await fileRepository.searchEverything(q, { limit: 4, filters: parseFileFilters({}, admin.rows[0].id) });
     console.log(`\n"${q}"  (${why})`);
     console.log(`   ${rows.length} hit(s)`);
     for (const r of rows) {
@@ -106,6 +142,16 @@ async function cleanup() {
   }
 
   console.log("\n--- a query that should find NOTHING ---");
-  const none = await fileRepository.searchEverything("zzzzqqqxyz", { limit: 5 });
+  const none = await fileRepository.searchEverything("zzzzqqqxyz", { limit: 5, filters: parseFileFilters({}, admin.rows[0].id) });
   console.log(`   ${none.length} hit(s) ${none.length === 0 ? "(correct)" : "(unexpected)"}`);
-})().catch((e) => console.error("\nFAILED:", e.message)).finally(cleanup);
+  if (none.length !== 0) failed = true;
+})()
+  // This script is mostly EXPLORATORY -- it prints ranked results for a human
+  // to judge, and deliberately asserts almost nothing. Two things can still be
+  // judged mechanically, so they are: a nonsense query must return nothing, and
+  // the script must not throw. Everything else is output to read, not a check.
+  .catch((e) => { console.error("\nFAILED:", e.message); failed = true; })
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed ? 1 : 0;
+  });

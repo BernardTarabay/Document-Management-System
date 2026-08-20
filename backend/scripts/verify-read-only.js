@@ -79,8 +79,12 @@ async function cleanup() {
   });
   await p.query("UPDATE rename_proposals SET status='approved' WHERE id=$1", [proposal.id]);
 
+  // ownerUserId is required since migration 028 -- enqueueJob resolves it for
+  // every production caller (queues/index.js resolveOwner), but this script
+  // builds the job row directly and so has to supply it itself.
   const job = await processingJobRepository.create({
-    jobType: "bulk_rename", storageLocationId: locId, payload: {}, createdBy: actor, progressTotal: 1,
+    jobType: "bulk_rename", storageLocationId: locId, payload: {},
+    createdBy: actor, ownerUserId: actor, progressTotal: 1,
   });
   jobId = job.id;
   const summary = await bulkRenameProcessor.handle(
@@ -117,4 +121,10 @@ async function cleanup() {
   check("old name gone from disk", !onDisk3.includes(ORIGINAL));
 
   log(`\n================ ${failed === 0 ? "ALL PASSED" : `${failed} FAILED`} (${passed} passed) ================`);
-})().catch((e) => { console.error("\nFAILED:", e); failed += 1; }).finally(cleanup);
+})()
+  .catch((e) => { console.error("\nFAILED:", e); failed += 1; })
+  // Exit code, so a runner can tell a failing run from a passing one.
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed === 0 ? 0 : 1;
+  });

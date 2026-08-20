@@ -101,6 +101,7 @@ async function run() {
   log("   new files on the second scan:", scan2.new, "(expected 0)");
 
   const ok = reused && locationCount === 1 && total === 4 && scan2.new === 0;
+  if (!ok) failed = true;
   log(`\n================ ${ok ? "PASS - no duplicate ingestion" : "FAIL - files were re-ingested"} ================`);
 
   log("\n--- trying to add the same folder while it is ACTIVE ---");
@@ -109,6 +110,7 @@ async function run() {
       { name: "Third Attempt", type: "local", rootPath: root, accessMode: "direct" },
       actor
     );
+    failed = true;
     log("   FAIL: a duplicate active location was allowed.");
   } catch (err) {
     log("   correctly refused:", err.message);
@@ -121,6 +123,7 @@ async function run() {
         { name: "Spelling Attempt", type: "local", rootPath: spelling, accessMode: "direct" },
         actor
       );
+      failed = true;
       log(`   FAIL: ${JSON.stringify(spelling)} created another location.`);
     } catch (err) {
       log(`   ${JSON.stringify(spelling)} -> refused as already registered`);
@@ -128,6 +131,13 @@ async function run() {
   }
 }
 
+// Every "FAIL:" this script printed was previously informational only -- it
+// said the wrong thing had happened and then exited 0 anyway.
+let failed = false;
+
 run()
-  .catch((e) => console.error("\nFAILED:", e))
-  .finally(cleanup);
+  .catch((e) => { console.error("\nFAILED:", e); failed = true; })
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed ? 1 : 0;
+  });

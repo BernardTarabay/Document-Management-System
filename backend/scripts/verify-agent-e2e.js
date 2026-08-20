@@ -39,8 +39,12 @@ async function setup() {
   log("temp root:", root);
 
   const { rows } = await pool.query(
-    `INSERT INTO storage_locations (name, type, root_path, access_mode, is_active)
-     VALUES ($1,'local',$2,'agent',true) RETURNING *`,
+    // owner_user_id became NOT NULL in migration 028. This raw INSERT predates
+    // that and had been failing on the not-null violation ever since -- which
+    // nobody saw, because this script exited 0 either way.
+    `INSERT INTO storage_locations (name, type, root_path, access_mode, is_active, owner_user_id)
+     VALUES ($1,'local',$2,'agent',true,
+             (SELECT id FROM users ORDER BY created_at LIMIT 1)) RETURNING *`,
     ["E2E Agent Location", root]
   );
   locationId = rows[0].id;
@@ -149,9 +153,20 @@ async function run() {
 
   const allOk = listOk && statOk && readOk && renameOk && traversalBlocked && scopeBlocked;
   log("\n================ RESULT:", allOk ? "ALL CHECKS PASSED" : "SOME CHECKS FAILED", "================");
+  // `allOk` was computed, printed, and then thrown away. This is the script
+  // `npm run verify:agent` runs -- the only one wired into package.json -- so
+  // for as long as it exited 0 regardless, that command could not fail.
+  if (!allOk) failed = true;
 }
 
+// Set by run() when a check fails, and by the catch below when it throws.
+// Module scope so the finally can read it after either path.
+let failed = false;
+
 run()
-  .catch((e) => console.error("\nFAILED:", e))
-  .finally(cleanup);
+  .catch((e) => { console.error("\nFAILED:", e); failed = true; })
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed ? 1 : 0;
+  });
 

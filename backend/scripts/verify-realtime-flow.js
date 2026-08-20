@@ -156,14 +156,31 @@ async function cleanup() {
     !fs.existsSync(path.join(source, "Finance")));
 
   console.log("\n--- building the mirror ---");
-  const summary = await mirrorService.sync();
-  const expected = path.join(mirror, "Finance", "Invoices", "Invoice Couvent St Elie July 2026.txt.lnk");
+  // The mirror is built per account (syncMirrorProcessor refuses a sync with
+  // no owner outright). This script predates that and called sync() bare.
+  const summary = await mirrorService.sync({ ownerUserId: actor });
+  // Under the owner's own subtree -- the mirror is per account.
+  const expected = path.join(mirrorService.mirrorRoot(actor), "Finance", "Invoices", "Invoice Couvent St Elie July 2026.txt.lnk");
   check("shortcut created under its subject folder", fs.existsSync(expected),
     path.relative(mirror, expected));
-  check("mirror wrote exactly one shortcut", summary.written === 1);
+  // NOT `summary.written === 1`. A sync covers everything the OWNER has, and
+  // this script signs in as the first user in the table -- who also owns the
+  // real repository. The moment that had canonical names of its own, the count
+  // became large and this failed on a number that was correct. The assertion
+  // above (this run's shortcut exists, at its subject path) says what this
+  // test actually cares about and stays true whatever else is in the database.
+  // Same reasoning, same wording, as verify-mirror.js.
+  check("mirror wrote at least this run's shortcut", summary.written >= 1,
+    `written=${summary.written}`);
 
   console.log("\n   source folder:", (await fsp.readdir(source)).join(", "));
   console.log("   mirror tree:  ", path.relative(mirror, expected));
 
   console.log(`\n================ ${failed === 0 ? "ALL PASSED" : `${failed} FAILED`} (${passed} passed) ================`);
-})().catch((e) => { console.error("\nFAILED:", e); failed += 1; }).finally(cleanup);
+})()
+  .catch((e) => { console.error("\nFAILED:", e); failed += 1; })
+  // Exit code, so a runner can tell a failing run from a passing one.
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed === 0 ? 0 : 1;
+  });

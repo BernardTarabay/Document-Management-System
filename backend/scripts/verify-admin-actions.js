@@ -172,4 +172,10 @@ async function run() {
 
 run()
   .catch((e) => { console.error("\nFAILED:", e); failed += 1; })
-  .finally(cleanup);
+  // The exit code is the only part of this a runner can read. Without it the
+  // script printed its failures and still exited 0, so `verify:all` -- and any
+  // CI -- would call a failing run a passing one.
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed === 0 ? 0 : 1;
+  });

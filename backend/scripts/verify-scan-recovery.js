@@ -164,7 +164,11 @@ const jobsFor = async (fileId, statuses = ["queued", "running"]) =>
   check("a scan over healthy files recovers nothing", scan3.recovered === 0, `recovered=${scan3.recovered}`);
 
   // --- the count the UI renders -------------------------------------------
-  const backlog = await fileRepository.countBacklogByLocation();
+  // Owner-scoped since migration 028. storageLocationService.js:49 -- the
+  // production caller -- has always passed it; this script called the
+  // repository directly and so never did, which threw once requireOwner
+  // started refusing a missing owner instead of quietly returning everything.
+  const backlog = await fileRepository.countBacklogByLocation(admin.id);
   log(`\nbacklog reported for this location: ${JSON.stringify(backlog[locId] || { inFlight: 0, stalled: 0 })}`);
 
   log(`\n================ ${failed === 0 ? "ALL PASSED" : `${failed} FAILED`} (${passed} passed) ================`);

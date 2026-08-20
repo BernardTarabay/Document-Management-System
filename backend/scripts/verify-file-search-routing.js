@@ -20,6 +20,10 @@ const fileContentRepository = require("../src/repositories/fileContentRepository
 const classificationResultRepository = require("../src/repositories/classificationResultRepository");
 const subjectRepository = require("../src/repositories/subjectRepository");
 const fileRepository = require("../src/repositories/fileRepository");
+// searchEverything scopes by owner through its filters (buildFilterClauses
+// refuses a missing owner). fileService.search does this for every production
+// caller; a script calling the repository directly has to do it itself.
+const { parseFileFilters } = require("../src/repositories/fileFilters");
 const { closeAllQueues } = require("../src/queues");
 const { closeRedisConnection } = require("../src/config/redis");
 
@@ -71,7 +75,7 @@ let root, locId;
     textQuality: "ok",
   });
 
-  const rows = await fileRepository.searchEverything("marina", { limit: 10, offset: 0 });
+  const rows = await fileRepository.searchEverything("marina", { limit: 10, offset: 0, filters: parseFileFilters({}, admin.id) });
   check("content search finds both files", rows.length === 2, `${rows.length} hit(s)`);
 
   const filed = rows.find((r) => r.filename_current === "marina lease.txt");
@@ -90,7 +94,7 @@ let root, locId;
 
   // Filename-only search has to carry the same fields, since the map
   // highlights from either kind of hit.
-  const byName = await fileRepository.searchEverything("lease", { limit: 10, offset: 0 });
+  const byName = await fileRepository.searchEverything("lease", { limit: 10, offset: 0, filters: parseFileFilters({}, admin.id) });
   const nameHit = byName.find((r) => r.filename_current === "marina lease.txt");
   check("a filename hit also carries subject_id", nameHit?.subject_id === subject.id, String(nameHit?.subject_id));
 

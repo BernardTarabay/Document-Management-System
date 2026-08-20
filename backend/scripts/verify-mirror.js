@@ -57,6 +57,9 @@ async function cleanup() {
   console.log("mirror root:", mirror);
 
   const admin = await p.query("SELECT id FROM users ORDER BY created_at LIMIT 1");
+  // The mirror is built per account. This script predates that and called
+  // sync() bare, which requireOwner now refuses outright.
+  const owner = admin.rows[0].id;
   const loc = await storageLocationService.create(
     { name: "Mirror Test", type: "local", rootPath: source, accessMode: "direct" }, admin.rows[0].id);
   locId = loc.id;
@@ -76,29 +79,39 @@ async function cleanup() {
   }
 
   console.log("\n--- building the mirror ---");
-  const summary = await mirrorService.sync();
+  const summary = await mirrorService.sync({ ownerUserId: owner });
   console.log("   summary:", JSON.stringify({
     candidates: summary.candidates, written: summary.written,
     pruned: summary.pruned, skippedOffline: summary.skippedOffline, errors: summary.errors.length,
   }));
 
+  // Walk the OWNER'S root, not MIRROR_ROOT itself. Each account's tree is
+  // nested under its own id (mirrorService.mirrorRoot), so listing from
+  // MIRROR_ROOT makes every path below start with a uuid segment and no
+  // expectation written as "Finance/Reports/..." can ever match.
+  const ownerRoot = mirrorService.mirrorRoot(owner);
   const listing = [];
   (function walk(d, rel = "") {
+    if (!fs.existsSync(d)) return;
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const r = path.join(rel, e.name);
       if (e.isDirectory()) walk(path.join(d, e.name), r);
       else listing.push(r);
     }
-  })(mirror);
+  })(ownerRoot);
   console.log("\n   mirror tree:");
   listing.sort().forEach((l) => console.log(`     ${l}`));
 
   // SCOPED TO THIS SCRIPT'S OWN FIXTURES.
   //
   // These used to assert `summary.written === 3`, which was only ever true
-  // while the database was empty: mirrorService.sync() is GLOBAL, so once the
-  // real repository had canonical names of its own the count became 266 and
-  // every run failed on a number that was actually correct. Asserting that
+  // while the database was empty: a sync covers everything the OWNER has, and
+  // this script signs in as the first user in the table -- who also owns the
+  // real repository. So once that had canonical names of its own the count
+  // became 266 and every run failed on a number that was actually correct.
+  // (The sync was global before ownership landed; it is per-account now, which
+  // narrows the blast radius but does not help here, since it is the same
+  // account either way.) Asserting that
   // MY three shortcuts exist says the same thing and stays true no matter
   // what else is in the database.
   // Distinct paths only: two fixtures deliberately claim the same canonical
@@ -111,10 +124,10 @@ async function cleanup() {
   check("a shortcut was written for every fixture file", missing.length === 0,
     missing.length ? `missing: ${missing.join(", ")}` : `${mine.length}/${mine.length}`);
 
-  // Scoped to the fixtures BY PATH, not by mirror root: the sync is global,
-  // so the real repository's shortcuts land in this temp mirror too and
-  // "starts with the mirror root" matches all of them.
-  const mineAbs = new Set(mine.map((rel) => path.join(mirror, rel)));
+  // Scoped to the fixtures BY PATH, not by mirror root: this account's real
+  // repository shortcuts land in this temp mirror too, so "starts with the
+  // mirror root" matches all of them, not just the three written here.
+  const mineAbs = new Set(mine.map((rel) => path.join(ownerRoot, rel)));
   const myErrors = summary.errors.filter((e) => mineAbs.has(String(e.shortcutPath || "")));
   check("no errors on the fixture shortcuts", myErrors.length === 0, JSON.stringify(myErrors).slice(0, 160));
 
@@ -136,7 +149,7 @@ async function cleanup() {
 
   console.log("\n--- do the shortcuts actually resolve? ---");
   if (process.platform === "win32") {
-    const lnk = path.join(mirror, listing.find((l) => l.endsWith(".lnk")));
+    const lnk = path.join(ownerRoot, listing.find((l) => l.endsWith(".lnk")));
     const target = execFileSync("powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command",
        `(New-Object -ComObject WScript.Shell).CreateShortcut('${lnk.replace(/'/g, "''")}').TargetPath`],
@@ -152,11 +165,11 @@ async function cleanup() {
     Object.keys(originals).every((n) => stillThere.includes(n)));
 
   console.log("\n--- re-running is idempotent, and prunes stale entries ---");
-  const again = await mirrorService.sync();
+  const again = await mirrorService.sync({ ownerUserId: owner });
   // Pruning is the assertion that matters for idempotency: a second run must
   // not delete anything it just wrote. The written COUNT is global and
   // therefore not this test's to predict.
-  const stillMine = mine.filter((rel) => fs.existsSync(path.join(mirror, rel)));
+  const stillMine = mine.filter((rel) => fs.existsSync(path.join(ownerRoot, rel)));
   check("a second run keeps every fixture shortcut and prunes nothing",
     stillMine.length === mine.length && again.pruned === 0,
     `kept=${stillMine.length}/${mine.length} pruned=${again.pruned}`);
@@ -164,14 +177,20 @@ async function cleanup() {
   // Drop a canonical name -> its shortcut should be pruned.
   const drop = files.rows[0];
   await p.query("UPDATE files SET canonical_filename=NULL, canonical_relative_dir=NULL WHERE id=$1", [drop.id]);
-  const third = await mirrorService.sync();
+  const third = await mirrorService.sync({ ownerUserId: owner });
   check("removing a canonical name prunes its shortcut", third.pruned === 1, `pruned=${third.pruned}`);
 
   // A user's own file in the mirror must survive pruning.
-  const userFile = path.join(mirror, "my own notes.txt");
+  const userFile = path.join(ownerRoot, "my own notes.txt");
   await fsp.writeFile(userFile, "not a shortcut");
-  await mirrorService.sync();
+  await mirrorService.sync({ ownerUserId: owner });
   check("a non-shortcut file in the mirror is left alone", fs.existsSync(userFile));
 
   console.log(`\n================ ${failed === 0 ? "ALL PASSED" : `${failed} FAILED`} (${passed} passed) ================`);
-})().catch((e) => { console.error("\nFAILED:", e); failed += 1; }).finally(cleanup);
+})()
+  .catch((e) => { console.error("\nFAILED:", e); failed += 1; })
+  // Exit code, so a runner can tell a failing run from a passing one.
+  .finally(async () => {
+    await cleanup();
+    process.exitCode = failed === 0 ? 0 : 1;
+  });
